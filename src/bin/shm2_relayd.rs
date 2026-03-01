@@ -90,11 +90,11 @@ fn usage() {
     );
 }
 
-fn set_pipeline_time(pipeline: &gst::Pipeline, base_time: gst::ClockTime) {
+fn set_pipeline_time(pipeline: &gst::Pipeline, base_time: Option<gst::ClockTime>) {
     let clock = gst::SystemClock::obtain();
     pipeline.use_clock(Some(&clock));
-    if base_time != gst::ClockTime::NONE {
-        pipeline.set_base_time(base_time);
+    if let Some(bt) = base_time {
+        pipeline.set_base_time(bt);
     } else if let Some(now) = clock.time() {
         pipeline.set_base_time(now);
     }
@@ -106,12 +106,12 @@ fn output_pipeline_create(shm_path: &str) -> Result<(gst::Pipeline, gst_app::App
         "appsrc name=appsrc is-live=true format=time stream-type=stream ! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 leaky=downstream ! shm2sink shm-path={}",
         shm_path
     );
-    let element = gst::parse_launch(&pipeline_str)?;
+    let element = gst::parse::launch(&pipeline_str)?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
         .map_err(|_| gst::glib::Error::new(gst::CoreError::Failed, "output pipeline must be a pipeline"))?;
 
-    set_pipeline_time(&pipeline, gst::ClockTime::NONE);
+    set_pipeline_time(&pipeline, None);
 
     let appsrc = pipeline
         .by_name("appsrc")
@@ -130,14 +130,16 @@ fn backend_pipeline_create(
     name: &str,
     pipeline_str: &str,
     appsrc: &gst_app::AppSrc,
-    base_time: gst::ClockTime,
+    base_time: Option<gst::ClockTime>,
 ) -> Result<gst::Pipeline, gst::glib::Error> {
-    let element = gst::parse_launch(pipeline_str)?;
+    let element = gst::parse::launch(pipeline_str)?;
     let pipeline = match element.clone().downcast::<gst::Pipeline>() {
         Ok(p) => p,
         Err(element) => {
-            let pipeline = gst::Pipeline::with_name(Some(name));
-            pipeline.add(&element)?;
+            let pipeline = gst::Pipeline::with_name(name);
+            pipeline
+                .add(&element)
+                .map_err(|err| gst::glib::Error::new(gst::CoreError::Failed, &err.to_string()))?;
             pipeline
         }
     };
@@ -148,14 +150,42 @@ fn backend_pipeline_create(
         .find_unlinked_pad(gst::PadDirection::Src)
         .ok_or_else(|| gst::glib::Error::new(gst::CoreError::Failed, "no unlinked src pad"))?;
 
+    let appsrc_weak = appsrc.downgrade();
+    let caps_set = Arc::new(AtomicBool::new(false));
+    let caps_set_cb = caps_set.clone();
+    let callbacks = gst_app::AppSinkCallbacks::builder()
+        .new_sample(move |sink| {
+            let appsrc = match appsrc_weak.upgrade() {
+                Some(a) => a,
+                None => return Err(gst::FlowError::Flushing),
+            };
+            let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+            if !caps_set_cb.load(Ordering::Relaxed) {
+                if let Some(caps) = sample.caps() {
+                    let caps = caps.to_owned();
+                    appsrc.set_caps(Some(&caps));
+                    caps_set_cb.store(true, Ordering::Relaxed);
+                }
+            }
+            let buffer = sample
+                .buffer()
+                .ok_or(gst::FlowError::Error)?
+                .copy_deep()
+                .map_err(|_| gst::FlowError::Error)?;
+            appsrc.push_buffer(buffer).map_err(|_| gst::FlowError::Error)?;
+            Ok(gst::FlowSuccess::Ok)
+        })
+        .build();
     let appsink = gst_app::AppSink::builder()
-        .emit_signals(true)
+        .callbacks(callbacks)
         .drop(true)
         .max_buffers(4)
         .build();
     appsink.set_property("sync", false);
 
-    pipeline.add(&appsink)?;
+    pipeline
+        .add(&appsink)
+        .map_err(|err| gst::glib::Error::new(gst::CoreError::Failed, &err.to_string()))?;
     let sink_pad = appsink
         .static_pad("sink")
         .ok_or_else(|| gst::glib::Error::new(gst::CoreError::Failed, "appsink sink pad missing"))?;
@@ -163,34 +193,15 @@ fn backend_pipeline_create(
         gst::glib::Error::new(gst::CoreError::Failed, "failed to link appsink")
     })?;
 
-    let appsrc_weak = appsrc.downgrade();
-    let caps_set = Arc::new(AtomicBool::new(false));
-    let caps_set_cb = caps_set.clone();
-    appsink.connect_new_sample(move |sink| {
-        let appsrc = match appsrc_weak.upgrade() {
-            Some(a) => a,
-            None => return Err(gst::FlowError::Flushing),
-        };
-        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-        if !caps_set_cb.load(Ordering::Relaxed) {
-            if let Some(caps) = sample.caps() {
-                appsrc.set_caps(Some(caps));
-                caps_set_cb.store(true, Ordering::Relaxed);
-            }
-        }
-        let buffer = sample
-            .buffer()
-            .ok_or(gst::FlowError::Error)?
-            .copy()
-            .map_err(|_| gst::FlowError::Error)?;
-        appsrc.push_buffer(buffer).map_err(|_| gst::FlowError::Error)?;
-        Ok(gst::FlowSuccess::Ok)
-    });
-
     Ok(pipeline)
 }
 
-fn run_tcp_listener(spec: &ListenSpec, sender: glib::Sender<usize>) -> io::Result<()> {
+fn run_tcp_listener(
+    spec: &ListenSpec,
+    main_ctx: glib::MainContext,
+    input_pipeline: Arc<gst::Pipeline>,
+    splash_pipeline: Option<Arc<gst::Pipeline>>,
+) -> io::Result<()> {
     let ListenSpec::Tcp { host, port } = spec else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not tcp"));
     };
@@ -207,14 +218,16 @@ fn run_tcp_listener(spec: &ListenSpec, sender: glib::Sender<usize>) -> io::Resul
             }
         };
         let current = count.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = sender.send(current);
+        notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
 
-        let sender_clone = sender.clone();
+        let main_ctx = main_ctx.clone();
+        let input_pipeline = input_pipeline.clone();
+        let splash_pipeline = splash_pipeline.clone();
         let count_clone = count.clone();
         thread::spawn(move || {
             let _ = hold_connection(stream);
             let current = count_clone.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
-            let _ = sender_clone.send(current);
+            notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
         });
     }
 
@@ -233,7 +246,13 @@ fn hold_connection(mut stream: std::net::TcpStream) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn run_vsock_listener(cid: u32, port: u32, sender: glib::Sender<usize>) -> io::Result<()> {
+fn run_vsock_listener(
+    cid: u32,
+    port: u32,
+    main_ctx: glib::MainContext,
+    input_pipeline: Arc<gst::Pipeline>,
+    splash_pipeline: Option<Arc<gst::Pipeline>>,
+) -> io::Result<()> {
     use libc::{AF_VSOCK, SOCK_STREAM};
     use std::mem::size_of;
 
@@ -276,14 +295,16 @@ fn run_vsock_listener(cid: u32, port: u32, sender: glib::Sender<usize>) -> io::R
             continue;
         }
         let current = count.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = sender.send(current);
+        notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
 
-        let sender_clone = sender.clone();
+        let main_ctx = main_ctx.clone();
+        let input_pipeline = input_pipeline.clone();
+        let splash_pipeline = splash_pipeline.clone();
         let count_clone = count.clone();
         thread::spawn(move || {
             let _ = hold_vsock_connection(conn);
             let current = count_clone.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
-            let _ = sender_clone.send(current);
+            notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
         });
     }
 }
@@ -304,6 +325,29 @@ fn hold_vsock_connection(fd: RawFd) -> io::Result<()> {
     }
     unsafe { libc::close(fd) };
     Ok(())
+}
+
+fn notify_client_count(
+    main_ctx: &glib::MainContext,
+    input_pipeline: &gst::Pipeline,
+    splash_pipeline: Option<&Arc<gst::Pipeline>>,
+    count: usize,
+) {
+    let input_pipeline = input_pipeline.clone();
+    let splash_pipeline = splash_pipeline.cloned();
+    main_ctx.invoke(move || {
+        if count > 0 {
+            let _ = input_pipeline.set_state(gst::State::Playing);
+            if let Some(splash) = &splash_pipeline {
+                let _ = splash.set_state(gst::State::Null);
+            }
+        } else {
+            let _ = input_pipeline.set_state(gst::State::Null);
+            if let Some(splash) = &splash_pipeline {
+                let _ = splash.set_state(gst::State::Playing);
+            }
+        }
+    });
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -338,21 +382,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let main_loop_clone = main_loop.clone();
 
     let bus = output_pipeline.bus().expect("pipeline bus");
-    bus.add_watch(move |_, msg| {
+    let _bus_watch = bus.add_watch(move |_, msg| {
         match msg.view() {
             gst::MessageView::Error(err) => {
                 let error = err.error();
                 eprintln!("output pipeline error: {error}");
                 main_loop_clone.quit();
-                return glib::Continue(false);
+                return glib::ControlFlow::Break;
             }
             gst::MessageView::Eos(..) => {
                 main_loop_clone.quit();
-                return glib::Continue(false);
+                return glib::ControlFlow::Break;
             }
             _ => {}
         }
-        glib::Continue(true)
+        glib::ControlFlow::Continue
     })?;
 
     output_pipeline.set_state(gst::State::Playing)?;
@@ -362,38 +406,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let input_pipeline = Arc::new(input_pipeline);
     let splash_pipeline = splash_pipeline.map(Arc::new);
-
-    let (sender, receiver) = glib::MainContext::channel::<usize>(glib::PRIORITY_DEFAULT);
-
-    let input_pipeline_clone = input_pipeline.clone();
-    let splash_pipeline_clone = splash_pipeline.clone();
-    receiver.attach(None, move |count| {
-        if count > 0 {
-            let _ = input_pipeline_clone.set_state(gst::State::Playing);
-            if let Some(splash) = &splash_pipeline_clone {
-                let _ = splash.set_state(gst::State::Null);
-            }
-        } else {
-            let _ = input_pipeline_clone.set_state(gst::State::Null);
-            if let Some(splash) = &splash_pipeline_clone {
-                let _ = splash.set_state(gst::State::Playing);
-            }
-        }
-        glib::Continue(true)
-    });
+    let main_ctx = glib::MainContext::default();
 
     thread::spawn({
-        let sender = sender.clone();
         let listen = listen.clone();
+        let main_ctx = main_ctx.clone();
+        let input_pipeline = input_pipeline.clone();
+        let splash_pipeline = splash_pipeline.clone();
         move || match listen {
             ListenSpec::Tcp { .. } => {
-                if let Err(err) = run_tcp_listener(&listen, sender) {
+                if let Err(err) = run_tcp_listener(&listen, main_ctx, input_pipeline, splash_pipeline) {
                     eprintln!("tcp listener error: {err}");
                 }
             }
             #[cfg(target_os = "linux")]
             ListenSpec::Vsock { cid, port } => {
-                if let Err(err) = run_vsock_listener(cid, port, sender) {
+                if let Err(err) = run_vsock_listener(cid, port, main_ctx, input_pipeline, splash_pipeline) {
                     eprintln!("vsock listener error: {err}");
                 }
             }
