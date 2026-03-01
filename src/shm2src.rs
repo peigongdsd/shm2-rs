@@ -1,4 +1,7 @@
-use std::sync::Mutex;
+use std::slice;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use gst::glib;
 use gst::prelude::*;
@@ -10,7 +13,7 @@ use gstreamer_base as gst_base;
 use once_cell::sync::Lazy;
 
 use crate::platform::posix_file::PosixFileBackend;
-use crate::transport::Reader;
+use crate::transport::{Reader, ReceivedDesc};
 
 type ReaderType = Reader<PosixFileBackend>;
 
@@ -34,8 +37,32 @@ impl Default for Settings {
 #[derive(Default)]
 struct State {
     settings: Settings,
-    reader: Option<ReaderType>,
+    reader: Option<Arc<Mutex<ReaderType>>>,
     unlocked: bool,
+}
+
+struct ShmReadWrap {
+    reader: Arc<Mutex<ReaderType>>,
+    desc: ReceivedDesc,
+    ptr: *const u8,
+    len: usize,
+}
+
+impl AsRef<[u8]> for ShmReadWrap {
+    fn as_ref(&self) -> &[u8] {
+        // Pointer and length are validated before wrapper creation.
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+unsafe impl Send for ShmReadWrap {}
+
+impl Drop for ShmReadWrap {
+    fn drop(&mut self) {
+        if let Ok(mut reader) = self.reader.lock() {
+            let _ = reader.recycle_desc(self.desc.buffer_id, self.desc.offset, self.desc.len, 0);
+        }
+    }
 }
 
 mod imp {
@@ -151,7 +178,7 @@ mod imp {
                 )
             })?;
             self.obj().set_live(state.settings.is_live);
-            state.reader = Some(reader);
+            state.reader = Some(Arc::new(Mutex::new(reader)));
             state.unlocked = false;
             Ok(())
         }
@@ -185,21 +212,51 @@ mod imp {
             &self,
             _buffer: Option<&mut gst::BufferRef>,
         ) -> Result<gst_base::subclass::base_src::CreateSuccess, gst::FlowError> {
-            let mut state = self.state.lock().expect("state poisoned");
-            if state.unlocked {
-                return Err(gst::FlowError::Flushing);
-            }
-            let reader = state.reader.as_mut().ok_or(gst::FlowError::Flushing)?;
-            let received = reader.recv_blocking().map_err(|_| gst::FlowError::Error)?;
-            reader
-                .recycle(&received)
-                .map_err(|_| gst::FlowError::Error)?;
-
-            let mut out = gst::Buffer::from_mut_slice(received.payload);
-            if let Some(buf) = out.get_mut() {
-                if received.pts_ns >= 0 {
-                    buf.set_pts(gst::ClockTime::from_nseconds(received.pts_ns as u64));
+            let reader = {
+                let state = self.state.lock().expect("state poisoned");
+                if state.unlocked {
+                    return Err(gst::FlowError::Flushing);
                 }
+                state
+                    .reader
+                    .as_ref()
+                    .cloned()
+                    .ok_or(gst::FlowError::Flushing)?
+            };
+
+            let (desc, ptr) = loop {
+                {
+                    let state = self.state.lock().expect("state poisoned");
+                    if state.unlocked {
+                        return Err(gst::FlowError::Flushing);
+                    }
+                }
+                let mut r = reader.lock().map_err(|_| gst::FlowError::Error)?;
+                match r.try_recv_desc().map_err(|_| gst::FlowError::Error)? {
+                    Some(desc) => {
+                        let ptr = r.payload_ptr(&desc).map_err(|_| gst::FlowError::Error)?;
+                        break (desc, ptr);
+                    }
+                    None => {
+                        drop(r);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            };
+
+            let wrap = ShmReadWrap {
+                reader,
+                desc,
+                ptr,
+                len: desc.len as usize,
+            };
+            let mem = gst::Memory::from_slice(wrap);
+            let mut out = gst::Buffer::new();
+            if let Some(buf) = out.get_mut() {
+                if desc.pts_ns >= 0 {
+                    buf.set_pts(gst::ClockTime::from_nseconds(desc.pts_ns as u64));
+                }
+                buf.append_memory(mem);
             }
             Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(out))
         }

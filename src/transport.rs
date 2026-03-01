@@ -153,6 +153,18 @@ pub struct ReceivedBuffer {
     pub offset: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ReceivedDesc {
+    pub seq: u64,
+    pub buffer_id: u32,
+    pub pts_ns: i64,
+    pub dts_ns: i64,
+    pub duration_ns: i64,
+    pub flags: u32,
+    pub offset: u64,
+    pub len: u32,
+}
+
 impl<B: ShmBackend> Writer<B> {
     pub fn create(backend: &B, path: &str, cfg: TransportConfig) -> Result<Self, ShmError> {
         if cfg.ready_capacity == 0 || cfg.recycle_capacity == 0 {
@@ -332,23 +344,13 @@ impl<B: ShmBackend> Reader<B> {
     }
 
     pub fn recv_blocking(&mut self) -> Result<ReceivedBuffer, ShmError> {
-        let cap = u64::from(self.hdr.ready_capacity);
         loop {
-            let head = self.hdr.ready_head.load(Ordering::Acquire);
-            let tail = self.hdr.ready_tail.load(Ordering::Relaxed);
-            if head != tail {
-                let idx = (tail % cap) as usize;
-                let desc = self.ready[idx];
-                let mut payload = vec![0u8; desc.length as usize];
+            if let Some(desc) = self.try_recv_desc()? {
+                let ptr = self.payload_ptr(&desc)?;
+                let mut payload = vec![0u8; desc.len as usize];
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        self.arena.add(desc.offset as usize),
-                        payload.as_mut_ptr(),
-                        payload.len(),
-                    );
+                    std::ptr::copy_nonoverlapping(ptr, payload.as_mut_ptr(), payload.len());
                 }
-                self.hdr.ready_tail.store(tail + 1, Ordering::Release);
-                self.touch_consumer_heartbeat();
                 return Ok(ReceivedBuffer {
                     seq: desc.seq,
                     buffer_id: desc.buffer_id,
@@ -365,7 +367,65 @@ impl<B: ShmBackend> Reader<B> {
         }
     }
 
+    pub fn recv_desc_blocking(&mut self) -> Result<ReceivedDesc, ShmError> {
+        loop {
+            if let Some(desc) = self.try_recv_desc()? {
+                return Ok(desc);
+            }
+            self.touch_consumer_heartbeat();
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub fn try_recv_desc(&mut self) -> Result<Option<ReceivedDesc>, ShmError> {
+        let cap = u64::from(self.hdr.ready_capacity);
+        let head = self.hdr.ready_head.load(Ordering::Acquire);
+        let tail = self.hdr.ready_tail.load(Ordering::Relaxed);
+        if head == tail {
+            return Ok(None);
+        }
+
+        let idx = (tail % cap) as usize;
+        let desc = self.ready[idx];
+        let out = ReceivedDesc {
+            seq: desc.seq,
+            buffer_id: desc.buffer_id,
+            pts_ns: desc.pts_ns,
+            dts_ns: desc.dts_ns,
+            duration_ns: desc.duration_ns,
+            flags: desc.flags,
+            offset: desc.offset,
+            len: desc.length,
+        };
+
+        self.validate_bounds(out.offset, out.len as usize)?;
+        self.hdr.ready_tail.store(tail + 1, Ordering::Release);
+        self.touch_consumer_heartbeat();
+        Ok(Some(out))
+    }
+
+    pub fn payload_ptr(&self, desc: &ReceivedDesc) -> Result<*const u8, ShmError> {
+        self.validate_bounds(desc.offset, desc.len as usize)?;
+        let ptr = unsafe { self.arena.add(desc.offset as usize) };
+        Ok(ptr as *const u8)
+    }
+
     pub fn recycle(&mut self, buf: &ReceivedBuffer) -> Result<(), ShmError> {
+        self.recycle_desc(
+            buf.buffer_id,
+            buf.offset,
+            buf.payload.len() as u32,
+            0, /* status=OK */
+        )
+    }
+
+    pub fn recycle_desc(
+        &mut self,
+        buffer_id: u32,
+        offset: u64,
+        length: u32,
+        status: u32,
+    ) -> Result<(), ShmError> {
         let cap = u64::from(self.hdr.rec_capacity);
         loop {
             let head = self.hdr.rec_head.load(Ordering::Relaxed);
@@ -374,10 +434,10 @@ impl<B: ShmBackend> Reader<B> {
                 let idx = (head % cap) as usize;
                 self.recycle[idx] = RecycleDesc {
                     seq: head + 1,
-                    buffer_id: buf.buffer_id,
-                    status: 0,
-                    offset: buf.offset,
-                    length: buf.payload.len() as u32,
+                    buffer_id,
+                    status,
+                    offset,
+                    length,
                     reserved: [0u8; 36],
                 };
                 self.hdr.rec_head.store(head + 1, Ordering::Release);
@@ -392,6 +452,17 @@ impl<B: ShmBackend> Reader<B> {
         self.hdr
             .consumer_heartbeat_ns
             .store(now_nanos(), Ordering::Relaxed);
+    }
+
+    fn validate_bounds(&self, offset: u64, len: usize) -> Result<(), ShmError> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(len)
+            .ok_or(ShmError::Protocol("overflow in payload bounds"))?;
+        if end > self.hdr.arena_size as usize {
+            return Err(ShmError::Protocol("payload out of arena bounds"));
+        }
+        Ok(())
     }
 }
 

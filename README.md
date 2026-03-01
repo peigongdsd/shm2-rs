@@ -18,7 +18,9 @@ Implemented:
   - `shm2sink` (BaseSink)
   - `shm2src` (PushSrc)
 
-Current plugin phase is **copy-path integration (phase A)**, not full zero-copy GstMemory integration yet.
+Current plugin status:
+- `shm2src`: **zero-copy output path implemented** (SHM-backed `GstMemory` + recycle on memory drop).
+- `shm2sink`: still uses copy-path from incoming upstream buffers into SHM (sink-side upstream allocator fast path not yet implemented).
 
 ## Repository Layout
 
@@ -110,14 +112,14 @@ gst-launch-1.0 -v \
 ```
 
 Notes:
-- Producer should be started before consumer for easiest startup.
-- Current implementation is copy-path (not zero-copy GstMemory yet).
+- Start producer before consumer with current startup behavior (`shm2src` expects SHM region to exist at start).
+- `shm2src` is zero-copy on output; `shm2sink` is still copy-path on input.
 - `shm-path` must point to the same shared-memory file on both sides.
 
 ## Limitations (Known)
 
-- `shm2src` currently copies payload into regular `GstBuffer` memory.
-- No custom GstAllocator/propose-allocation zero-copy path yet.
+- No custom GstAllocator/propose-allocation sink fast path yet (upstream->sink still copied into SHM).
+- `shm2src` currently requires producer/SHM file to exist when source starts.
 - No full stress/fault-recovery automated test matrix yet.
 
 ## Next Steps
