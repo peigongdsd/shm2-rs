@@ -419,7 +419,10 @@ mod imp {
                         }
                     }
 
-                    let mut out_pts_ns = desc.pts_ns;
+                    // Never fall back to raw producer PTS while reset is still unanchored.
+                    // Doing so can push frames into far-future timeline on reconnect and
+                    // make sync=true sinks appear frozen.
+                    let mut out_pts_ns = -1;
                     if ts.need_reset {
                         if let Some(now) = now_rt {
                             ts.in_base_pts_ns = Some(desc.pts_ns.max(0));
