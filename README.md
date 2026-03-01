@@ -23,6 +23,7 @@ Implemented:
 Current plugin status:
 - `shm2src`: **zero-copy output path implemented** (SHM-backed `GstMemory` + recycle on memory drop).
 - `shm2sink`: **upstream zero-copy fast path implemented** via `propose_allocation` + custom allocator, with copy fallback for non-cooperating upstream memory.
+- No consumer ownership/heartbeat gating: sink always publishes into SHM and drops/overwrites when full.
 
 ## Repository Layout
 
@@ -123,6 +124,20 @@ gst-launch-1.0 -v \
   queue ! videoconvert ! autovideosink
 ```
 
+### Properties (current)
+
+`shm2sink`:
+- `shm-path` (string)
+- `shm-size` (u64)
+- `perms` (u32)
+- `timeline-beacon-ms` (u32)
+
+`shm2src`:
+- `shm-path` (string)
+- `is-live` (bool)
+- `live-only` (bool): restart output timeline on attach/re-attach
+- `latest-only` (bool): low-latency read policy (second-newest when available)
+
 Audio example:
 
 Terminal 1:
@@ -141,10 +156,12 @@ gst-launch-1.0 -v \
 ```
 
 Notes:
-- Start producer before consumer with current startup behavior (`shm2src` expects SHM region to exist at start).
+- Start producer before consumer (`shm2src` expects SHM region to exist at start).
 - `shm2src` is zero-copy on output.
 - `shm2sink` uses zero-copy fast path when upstream adopts the proposed allocator; otherwise it falls back to copy.
 - `shm-path` must resolve to the same shared-memory region on both sides.
+- Sink never blocks for a consumer; when the arena fills it drops the oldest ready frame, and if the ready ring is empty it resets the arena.
+- Multiple readers are undefined behavior (no consumer ownership enforcement).
 
 ## Limitations (Known)
 
