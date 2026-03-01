@@ -375,6 +375,10 @@ impl Writer {
         now_nanos().saturating_sub(hb) <= timeout_ns
     }
 
+    pub fn producer_heartbeat_tick(&self) {
+        self.touch_producer_heartbeat();
+    }
+
     fn touch_producer_heartbeat(&self) {
         self.hdr
             .producer_heartbeat_ns
@@ -578,6 +582,10 @@ impl Reader {
             producer_pts_ns: self.hdr.timeline_producer_pts_ns.load(Ordering::Acquire) as i64,
             ready_head: self.hdr.timeline_ready_head.load(Ordering::Acquire),
         }
+    }
+
+    pub fn consumer_heartbeat_tick(&self) {
+        self.touch_consumer_heartbeat();
     }
 
     fn touch_consumer_heartbeat(&self) {

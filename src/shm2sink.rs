@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -51,6 +52,8 @@ struct State {
     writer: Option<Arc<Mutex<WriterType>>>,
     allocator: Option<ShmArenaAllocator>,
     unlocked: bool,
+    hb_stop: Option<Arc<AtomicBool>>,
+    hb_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -408,11 +411,33 @@ mod imp {
             state.writer = Some(writer);
             state.allocator = Some(allocator);
             state.unlocked = false;
+
+            if let Some(t) = state.hb_thread.take() {
+                let _ = t.join();
+            }
+            if let Some(writer_arc) = state.writer.as_ref().cloned() {
+                let stop = Arc::new(AtomicBool::new(false));
+                state.hb_stop = Some(stop.clone());
+                state.hb_thread = Some(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(w) = writer_arc.lock() {
+                            w.producer_heartbeat_tick();
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }));
+            }
             Ok(())
         }
 
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
+            if let Some(stop) = state.hb_stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            if let Some(t) = state.hb_thread.take() {
+                let _ = t.join();
+            }
             if let Some(writer) = &state.writer {
                 if let Ok(w) = writer.lock() {
                     w.set_stopped();

@@ -1,4 +1,5 @@
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -54,6 +55,8 @@ struct State {
     reader: Option<Arc<Mutex<ReaderType>>>,
     unlocked: bool,
     timeline: TimelineState,
+    hb_stop: Option<Arc<AtomicBool>>,
+    hb_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 struct ShmReadWrap {
@@ -284,6 +287,22 @@ mod imp {
             state.timeline.out_base_running_ns = None;
             state.timeline.last_sync_seq = 0;
             state.timeline.expected_sync_gen = snap.generation;
+
+            if let Some(t) = state.hb_thread.take() {
+                let _ = t.join();
+            }
+            if let Some(reader_arc) = state.reader.as_ref().cloned() {
+                let stop = Arc::new(AtomicBool::new(false));
+                state.hb_stop = Some(stop.clone());
+                state.hb_thread = Some(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(r) = reader_arc.lock() {
+                            r.consumer_heartbeat_tick();
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }));
+            }
             Ok(())
         }
 
@@ -301,6 +320,12 @@ mod imp {
             state.timeline.out_base_running_ns = None;
             state.timeline.last_sync_seq = 0;
             state.timeline.expected_sync_gen = 0;
+            if let Some(stop) = state.hb_stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            if let Some(t) = state.hb_thread.take() {
+                let _ = t.join();
+            }
             Ok(())
         }
 
