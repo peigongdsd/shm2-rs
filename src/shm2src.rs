@@ -68,6 +68,18 @@ impl Drop for ShmReadWrap {
     }
 }
 
+fn poll_yield_sleep(idle_cycles: &mut u32, steady_sleep: Duration) {
+    thread::yield_now();
+    let sleep_for = match *idle_cycles {
+        0..=7 => Duration::from_micros(50),
+        8..=31 => Duration::from_micros(200),
+        32..=127 => Duration::from_millis(1),
+        _ => steady_sleep,
+    };
+    thread::sleep(sleep_for);
+    *idle_cycles = idle_cycles.saturating_add(1);
+}
+
 mod imp {
     use super::*;
 
@@ -248,6 +260,7 @@ mod imp {
                     .ok_or(gst::FlowError::Flushing)?
             };
 
+            let mut idle_cycles = 0u32;
             let (desc, ptr) = loop {
                 {
                     let state = self.state.lock().expect("state poisoned");
@@ -263,7 +276,7 @@ mod imp {
                     }
                     None => {
                         drop(r);
-                        thread::sleep(Duration::from_millis(1));
+                        poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
                     }
                 }
             };

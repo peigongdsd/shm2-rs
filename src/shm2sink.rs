@@ -206,6 +206,18 @@ impl ShmArenaAllocator {
     }
 }
 
+fn poll_yield_sleep(idle_cycles: &mut u32, steady_sleep: Duration) {
+    thread::yield_now();
+    let sleep_for = match *idle_cycles {
+        0..=7 => Duration::from_micros(50),
+        8..=31 => Duration::from_micros(200),
+        32..=127 => Duration::from_millis(1),
+        _ => steady_sleep,
+    };
+    thread::sleep(sleep_for);
+    *idle_cycles = idle_cycles.saturating_add(1);
+}
+
 mod imp {
     use super::*;
 
@@ -398,6 +410,8 @@ mod imp {
         fn render(&self, buffer: &gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
             let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
             let pts_ns = buffer.pts().map(|v| v.nseconds() as i64).unwrap_or(-1);
+            let mut idle_no_consumer = 0u32;
+            let mut idle_no_space = 0u32;
 
             loop {
                 let mut state = self.state.lock().expect("state poisoned");
@@ -420,7 +434,7 @@ mod imp {
                         .is_consumer_online(timeout_ns)
                 {
                     drop(state);
-                    thread::sleep(Duration::from_millis(5));
+                    poll_yield_sleep(&mut idle_no_consumer, Duration::from_millis(5));
                     continue;
                 }
 
@@ -455,12 +469,18 @@ mod imp {
                                                 if wait_for_connection =>
                                             {
                                                 drop(state);
-                                                thread::sleep(Duration::from_millis(5));
+                                                poll_yield_sleep(
+                                                    &mut idle_no_consumer,
+                                                    Duration::from_millis(5),
+                                                );
                                                 continue;
                                             }
                                             Err(crate::platform::ShmError::Exhausted) => {
                                                 drop(state);
-                                                thread::sleep(Duration::from_millis(1));
+                                                poll_yield_sleep(
+                                                    &mut idle_no_space,
+                                                    Duration::from_millis(1),
+                                                );
                                                 continue;
                                             }
                                             Err(_) => return Err(gst::FlowError::Error),
@@ -481,11 +501,11 @@ mod imp {
                     Ok(_) => return Ok(gst::FlowSuccess::Ok),
                     Err(crate::platform::ShmError::Exhausted) => {
                         drop(state);
-                        thread::sleep(Duration::from_millis(1));
+                        poll_yield_sleep(&mut idle_no_space, Duration::from_millis(1));
                     }
                     Err(crate::platform::ShmError::NoConsumer) if wait_for_connection => {
                         drop(state);
-                        thread::sleep(Duration::from_millis(5));
+                        poll_yield_sleep(&mut idle_no_consumer, Duration::from_millis(5));
                     }
                     Err(_) => return Err(gst::FlowError::Error),
                 }

@@ -18,6 +18,18 @@ const STATE_STOPPED: u32 = 3;
 const HEADER_PAD: usize = 4096;
 const DESC_ALIGN: usize = 64;
 
+fn poll_yield_sleep(idle_cycles: &mut u32, steady_sleep: Duration) {
+    thread::yield_now();
+    let sleep_for = match *idle_cycles {
+        0..=7 => Duration::from_micros(50),
+        8..=31 => Duration::from_micros(200),
+        32..=127 => Duration::from_millis(1),
+        _ => steady_sleep,
+    };
+    thread::sleep(sleep_for);
+    *idle_cycles = idle_cycles.saturating_add(1);
+}
+
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReadyDesc {
@@ -261,6 +273,7 @@ impl Writer {
         if !self.is_consumer_online(1_000_000_000) {
             return Err(ShmError::NoConsumer);
         }
+        let mut idle_cycles = 0u32;
         loop {
             let head = self.hdr.ready_head.load(Ordering::Relaxed);
             let tail = self.hdr.ready_tail.load(Ordering::Acquire);
@@ -285,7 +298,7 @@ impl Writer {
                 return Ok(());
             }
             self.drain_recycles();
-            thread::sleep(Duration::from_millis(1));
+            poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
         }
     }
 
@@ -390,6 +403,7 @@ impl Reader {
     }
 
     pub fn recv_blocking(&mut self) -> Result<ReceivedBuffer, ShmError> {
+        let mut idle_cycles = 0u32;
         loop {
             if let Some(desc) = self.try_recv_desc()? {
                 let ptr = self.payload_ptr(&desc)?;
@@ -409,17 +423,18 @@ impl Reader {
                 });
             }
             self.touch_consumer_heartbeat();
-            thread::sleep(Duration::from_millis(1));
+            poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
         }
     }
 
     pub fn recv_desc_blocking(&mut self) -> Result<ReceivedDesc, ShmError> {
+        let mut idle_cycles = 0u32;
         loop {
             if let Some(desc) = self.try_recv_desc()? {
                 return Ok(desc);
             }
             self.touch_consumer_heartbeat();
-            thread::sleep(Duration::from_millis(1));
+            poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
         }
     }
 
@@ -474,6 +489,7 @@ impl Reader {
         status: u32,
     ) -> Result<(), ShmError> {
         let cap = u64::from(self.hdr.rec_capacity);
+        let mut idle_cycles = 0u32;
         loop {
             let head = self.hdr.rec_head.load(Ordering::Relaxed);
             let tail = self.hdr.rec_tail.load(Ordering::Acquire);
@@ -491,7 +507,7 @@ impl Reader {
                 self.touch_consumer_heartbeat();
                 return Ok(());
             }
-            thread::sleep(Duration::from_millis(1));
+            poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
         }
     }
 
