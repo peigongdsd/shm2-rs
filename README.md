@@ -67,6 +67,53 @@ GST_PLUGIN_PATH=$PWD/target/debug gst-inspect-1.0 shm2sink
 GST_PLUGIN_PATH=$PWD/target/debug gst-inspect-1.0 shm2src
 ```
 
+## Pipeline Usage (Current `shm2sink` / `shm2src`)
+
+Use `GST_PLUGIN_PATH` so GStreamer can find `libgstshm2.so`:
+
+```bash
+export GST_PLUGIN_PATH=$PWD/target/debug
+```
+
+Terminal 1 (producer pipeline):
+
+```bash
+gst-launch-1.0 -v \
+  videotestsrc is-live=true pattern=ball ! \
+  video/x-raw,format=I420,width=320,height=240,framerate=30/1 ! \
+  shm2sink shm-path=/dev/shm/gst-shm2-pipe
+```
+
+Terminal 2 (consumer pipeline):
+
+```bash
+gst-launch-1.0 -v \
+  shm2src shm-path=/dev/shm/gst-shm2-pipe is-live=true ! \
+  queue ! videoconvert ! autovideosink
+```
+
+Audio example:
+
+Terminal 1:
+```bash
+gst-launch-1.0 -v \
+  audiotestsrc is-live=true wave=sine ! \
+  audio/x-raw,format=S16LE,channels=2,rate=48000 ! \
+  shm2sink shm-path=/dev/shm/gst-shm2-audio
+```
+
+Terminal 2:
+```bash
+gst-launch-1.0 -v \
+  shm2src shm-path=/dev/shm/gst-shm2-audio is-live=true ! \
+  queue ! audioconvert ! audioresample ! autoaudiosink
+```
+
+Notes:
+- Producer should be started before consumer for easiest startup.
+- Current implementation is copy-path (not zero-copy GstMemory yet).
+- `shm-path` must point to the same shared-memory file on both sides.
+
 ## Limitations (Known)
 
 - `shm2src` currently copies payload into regular `GstBuffer` memory.
