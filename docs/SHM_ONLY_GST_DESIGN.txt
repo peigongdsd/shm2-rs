@@ -12,8 +12,7 @@ Implementation snapshot (March 1, 2026)
 - `shm2src` output zero-copy is implemented (SHM-backed readonly memory with recycle-on-drop).
 - `shm2sink` upstream zero-copy fast path is implemented via `propose_allocation` + custom allocator.
 - `shm2sink` retains copy fallback for non-cooperating upstream memory.
-- Single-consumer ownership is enforced (`claim_consumer`/`release_consumer`).
-- Sink connection behavior is heartbeat-based (`wait-for-connection`, `consumer-timeout-ms`).
+- Sink runs continuously with no consumer ownership or heartbeat gating.
 - Platform/backend decoupling is implemented end-to-end in plugin + transport:
   - backend is resolved from `shm-path` at runtime
   - transport uses backend trait objects (no backend generics in element code)
@@ -64,7 +63,7 @@ This design keeps the protocol memory-native:
 - sequence counters
 - ring slots
 - allocator state
-- peer liveness heartbeats
+- optional liveness hints (non-gating)
 
 Notification model for portability:
 - Required: polling (works everywhere shared memory works).
@@ -161,8 +160,6 @@ Fields (fixed offsets; do not use Rust repr-default):
 - state (u32): INIT, RUNNING, STOPPING, STOPPED, ERROR
 - owner_pid (u32) (debug)
 - epoch (u64): increment on sink re-init to invalidate stale attachments
-- producer_heartbeat_ns (u64)
-- consumer_heartbeat_ns (u64)
 
 Ready ring control:
 - ready_capacity (u32)
@@ -314,8 +311,6 @@ Properties (current in shm2-rs)
 - shm-path (string)
 - shm-size (u64)
 - perms (mode)
-- wait-for-connection (bool)
-- consumer-timeout-ms (u32)
 
 Properties (planned/future)
 - buffer-time (ns, like shmsink semantics)
@@ -358,7 +353,6 @@ Core behavior
 - unlock/unlock_stop:
   - break polling loop similarly to current shmsrc semantics
 - stop():
-  - update heartbeat, detach cleanly
 
 
 11. Buffer Lifetime Contract
@@ -370,7 +364,6 @@ Exactly-once recycle rule
 
 Failure cases
 - Src crashes before recycle:
-  - sink detects stale consumer heartbeat
   - sink enters recovery policy:
     - safe mode: reclaim all outstanding after timeout and epoch bump
     - strict mode: stop with error
@@ -384,13 +377,7 @@ No in-place consumer mutation
 ---------------------------------------
 
 Connection detection
-- Src sets consumer_heartbeat periodically.
-- Sink sets producer_heartbeat periodically.
-- "Connected" means heartbeat freshness within timeout.
-
-wait-for-connection behavior
-- If wait_for_connection=true, sink render blocks until consumer heartbeat becomes fresh.
-- If false, sink may drop or queue according to policy.
+- No explicit connection ownership or heartbeat gating. Src attaches and begins reading immediately.
 
 
 13. Notification and Wake-Up Modes
@@ -426,7 +413,7 @@ Stale ring pointers
 
 Crash recovery
 - Sink startup can detect stale existing file:
-  - if state RUNNING but owner pid dead or heartbeat stale, reinitialize with new epoch.
+- if state RUNNING but mapping is stale or corrupted, reinitialize with new epoch.
 
 
 15. Security and Permissions
@@ -596,8 +583,7 @@ Completed
 - Protocol structs, SPSC ready/recycle rings, producer allocator.
 - `shm2src` zero-copy output path with recycle on memory drop.
 - `shm2sink` custom allocator + `propose_allocation` fast path + copy fallback.
-- Heartbeat-based wait semantics (`wait-for-connection`, `consumer-timeout-ms`).
-- Single active consumer enforcement at protocol layer.
+- No consumer ownership enforcement; multiple readers are undefined behavior.
 - Runtime backend resolution from `shm-path` in plugin and test binaries.
 - Transport backend decoupling via trait objects (`Box<dyn SharedRegion>`, `&dyn ShmBackend`).
 - Windows named shared memory backend implementation.
@@ -605,7 +591,7 @@ Completed
 
 Not completed yet
 - Optional futex optimization.
-- Robust crash-recovery epoch refinements beyond current heartbeat ownership model.
+- Robust crash-recovery epoch refinements beyond current ownership-free model.
 - ivshmem-specific notifier integration.
 - Automated CI matrix for Linux + Windows gst integration runs.
 
@@ -643,8 +629,6 @@ Element code must never call mmap/open/Win32 APIs directly; it only uses `shm_pl
   - `shm-path` (string)
   - `shm-size` (u64)
   - `perms` (u32)
-  - `wait-for-connection` (bool)
-  - `consumer-timeout-ms` (u32)
 - Lifecycle:
   - `start()`: create writer transport and set running state
   - `render()`: publish descriptors into SHM with two paths:
@@ -661,7 +645,7 @@ Element code must never call mmap/open/Win32 APIs directly; it only uses `shm_pl
   - `shm-path` (string)
   - `is-live` (bool)
 - Lifecycle:
-  - `start()`: open reader transport and claim single-consumer ownership
+  - `start()`: open reader transport and sync startup state
   - `create()`: read next descriptor and output SHM-backed readonly GstBuffer memory
   - `stop()`: close mapping
   - `unlock()/unlock_stop()`: interrupt/restart blocking read loops
@@ -681,8 +665,6 @@ Element code must never call mmap/open/Win32 APIs directly; it only uses `shm_pl
 - On protocol violation: element posts GST error and transitions to failure.
 
 23.6 Current behavior notes
-- Sink waits (blocks upstream via render backpressure) when `wait-for-connection=true` and no fresh consumer heartbeat is present.
-- If a consumer vanishes mid-stream, sink transitions to wait/retry loop (not process kill) while unlocked=false.
 - Protocol currently enforces a single active `shm2src`; second source fails during `start()` with explicit error.
 - Sink-side zero-copy is opportunistic; non-matching upstream memory uses fallback copy path.
 
@@ -727,7 +709,7 @@ Implemented objective
 
 24.6 Current test coverage and gaps
 - Present automated unit tests cover allocator coalescing and descriptor alignment.
-- Manual/integration runs cover end-to-end pipeline operation, single-consumer rejection, and attach/detach blocking behavior.
+- Manual/integration runs cover end-to-end pipeline operation and attach/detach behavior.
 - Added script-level integration test (`shm2-rs/scripts/nv12_attach_detach_test.sh`) for NV12 1920x1080@30 with repeated source attach/detach.
 - Added script-level URI/backends tests:
   - `shm2-rs/scripts/nv12_attach_detach_uri_test.sh` for `shm://` selection on Linux.

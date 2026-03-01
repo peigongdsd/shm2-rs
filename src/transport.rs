@@ -8,7 +8,7 @@ use crate::platform::{SharedRegion, ShmBackend, ShmError};
 
 pub const MAGIC: [u8; 8] = *b"GSTSHM2\0";
 pub const VERSION_MAJOR: u16 = 1;
-pub const VERSION_MINOR: u16 = 1;
+pub const VERSION_MINOR: u16 = 3;
 
 const STATE_INIT: u32 = 0;
 const STATE_RUNNING: u32 = 1;
@@ -84,10 +84,7 @@ pub struct SharedHeader {
     pub features: u64,
     pub state: AtomicU32,
     pub owner_pid: u32,
-    pub consumer_owner_pid: AtomicU32,
     pub epoch: AtomicU64,
-    pub producer_heartbeat_ns: AtomicU64,
-    pub consumer_heartbeat_ns: AtomicU64,
 
     pub ready_capacity: u32,
     pub ready_entry_size: u32,
@@ -108,7 +105,6 @@ pub struct SharedHeader {
     pub arena_high_watermark: AtomicU64,
     pub alloc_failures: AtomicU64,
 
-    pub wait_for_connection: AtomicU32,
     pub drop_when_no_consumer: AtomicU32,
     pub notify_mode: AtomicU32,
 
@@ -132,7 +128,6 @@ pub struct TransportConfig {
     pub ready_capacity: u32,
     pub recycle_capacity: u32,
     pub perms: u32,
-    pub wait_for_connection: bool,
     pub drop_when_no_consumer: bool,
     pub allocator_align: u64,
     pub timeline_beacon_ms: u32,
@@ -145,7 +140,6 @@ impl Default for TransportConfig {
             ready_capacity: 4096,
             recycle_capacity: 4096,
             perms: 0o660,
-            wait_for_connection: true,
             drop_when_no_consumer: false,
             allocator_align: 64,
             timeline_beacon_ms: 250,
@@ -261,7 +255,6 @@ impl Writer {
             recycle.as_ptr() as usize - region.as_ptr().as_ptr() as usize,
             arena_ptr as usize - region.as_ptr().as_ptr() as usize,
             arena_size,
-            cfg.wait_for_connection,
             cfg.drop_when_no_consumer,
         );
 
@@ -298,7 +291,7 @@ impl Writer {
                 break alloc;
             }
             eprintln!(
-                "[shm2] allocator full, dropping oldest ready buffer ready_used={}/{} rec_used={}/{} consumer_owner={} consumer_hb_age_ns={}",
+                "[shm2] allocator full, dropping oldest ready buffer ready_used={}/{} rec_used={}/{}",
                 self.hdr
                     .ready_head
                     .load(Ordering::Acquire)
@@ -308,11 +301,7 @@ impl Writer {
                     .rec_head
                     .load(Ordering::Acquire)
                     .saturating_sub(self.hdr.rec_tail.load(Ordering::Acquire)),
-                self.hdr.rec_capacity,
-                self.hdr.consumer_owner_pid.load(Ordering::Acquire),
-                now_nanos().saturating_sub(
-                    self.hdr.consumer_heartbeat_ns.load(Ordering::Acquire)
-                )
+                self.hdr.rec_capacity
             );
             if self.drop_oldest_ready() {
                 continue;
@@ -361,9 +350,6 @@ impl Writer {
     }
 
     pub fn publish_lease(&mut self, lease: AllocLease, pts_ns: i64) -> Result<(), ShmError> {
-        if !self.is_consumer_online(1_000_000_000) {
-            return Err(ShmError::NoConsumer);
-        }
         let mut idle_cycles = 0u32;
         loop {
             let head = self.hdr.ready_head.load(Ordering::Relaxed);
@@ -384,7 +370,6 @@ impl Writer {
                     reserved: [0u8; 8],
                 };
                 self.hdr.ready_head.store(head + 1, Ordering::Release);
-                self.touch_producer_heartbeat();
                 self.update_usage_metrics();
                 self.maybe_publish_timeline_snapshot(pts_ns, head + 1);
                 return Ok(());
@@ -414,7 +399,6 @@ impl Writer {
         self.hdr
             .arena_used_bytes
             .store(self.allocator.used_bytes(), Ordering::Relaxed);
-        self.touch_producer_heartbeat();
     }
 
     fn drop_oldest_ready(&mut self) -> bool {
@@ -445,30 +429,6 @@ impl Writer {
 
     pub fn region_size(&self) -> usize {
         self.region.len()
-    }
-
-    pub fn is_consumer_online(&self, timeout_ns: u64) -> bool {
-        let owner = self.hdr.consumer_owner_pid.load(Ordering::Acquire);
-        if owner == 0 {
-            return false;
-        }
-        let hb = self.hdr.consumer_heartbeat_ns.load(Ordering::Acquire);
-        if hb == 0 {
-            return false;
-        }
-        let age = now_nanos().saturating_sub(hb);
-        let online = age <= timeout_ns;
-        online
-    }
-
-    pub fn producer_heartbeat_tick(&self) {
-        self.touch_producer_heartbeat();
-    }
-
-    fn touch_producer_heartbeat(&self) {
-        self.hdr
-            .producer_heartbeat_ns
-            .store(now_nanos(), Ordering::Relaxed);
     }
 
     fn update_usage_metrics(&self) {
@@ -602,7 +562,6 @@ impl Reader {
                     offset: desc.offset,
                 });
             }
-            self.touch_consumer_heartbeat();
             poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
         }
     }
@@ -613,7 +572,6 @@ impl Reader {
             if let Some(desc) = self.try_recv_desc()? {
                 return Ok(desc);
             }
-            self.touch_consumer_heartbeat();
             poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
         }
     }
@@ -623,7 +581,6 @@ impl Reader {
         let head = self.hdr.ready_head.load(Ordering::Acquire);
         let tail = self.hdr.ready_tail.load(Ordering::Relaxed);
         if head == tail {
-            self.touch_consumer_heartbeat();
             return Ok(None);
         }
 
@@ -642,7 +599,6 @@ impl Reader {
 
         self.validate_bounds(out.offset, out.len as usize)?;
         self.hdr.ready_tail.store(tail + 1, Ordering::Release);
-        self.touch_consumer_heartbeat();
         Ok(Some(out))
     }
 
@@ -651,7 +607,6 @@ impl Reader {
         let head = self.hdr.ready_head.load(Ordering::Acquire);
         let tail = self.hdr.ready_tail.load(Ordering::Relaxed);
         if head == tail {
-            self.touch_consumer_heartbeat();
             return Ok(None);
         }
 
@@ -696,7 +651,6 @@ impl Reader {
         // Advance tail to keep only the newest entry when possible.
         let new_tail = if len <= 1 { head } else { head - 1 };
         self.hdr.ready_tail.store(new_tail, Ordering::Release);
-        self.touch_consumer_heartbeat();
         Ok(Some((out, dropped)))
     }
 
@@ -738,7 +692,6 @@ impl Reader {
                     reserved: [0u8; 36],
                 };
                 self.hdr.rec_head.store(head + 1, Ordering::Release);
-                self.touch_consumer_heartbeat();
                 return Ok(());
             }
             poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
@@ -768,7 +721,6 @@ impl Reader {
             reserved: [0u8; 36],
         };
         self.hdr.rec_head.store(head + 1, Ordering::Release);
-        self.touch_consumer_heartbeat();
         true
     }
 
@@ -802,60 +754,15 @@ impl Reader {
         true
     }
 
-    pub fn consumer_heartbeat_tick(&self) {
-        self.touch_consumer_heartbeat();
-    }
-
-    fn touch_consumer_heartbeat(&self) {
-        self.hdr
-            .consumer_heartbeat_ns
-            .store(now_nanos(), Ordering::Relaxed);
-    }
-
-    pub fn claim_consumer(&mut self, pid: u32) -> Result<(), ShmError> {
-        let resync_to_latest = || {
-            // On (re)attach, skip stale queued frames and start from the latest point.
-            let head = self.hdr.ready_head.load(Ordering::Acquire);
-            self.hdr.ready_tail.store(head, Ordering::Release);
-        };
-
-        match self.hdr.consumer_owner_pid.compare_exchange(
-            0,
-            pid,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                self.hdr.timeline_gen.fetch_add(1, Ordering::AcqRel);
-                self.hdr.timeline_valid.store(0, Ordering::Release);
-                let _gen = self.hdr.startup_gen.fetch_add(1, Ordering::AcqRel) + 1;
-                self.hdr.startup_state.store(STARTUP_SINK_READY, Ordering::Release);
-                self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
-                resync_to_latest();
-                self.touch_consumer_heartbeat();
-                Ok(())
-            }
-            Err(current) if current == pid => {
-                self.hdr.timeline_gen.fetch_add(1, Ordering::AcqRel);
-                self.hdr.timeline_valid.store(0, Ordering::Release);
-                let _gen = self.hdr.startup_gen.fetch_add(1, Ordering::AcqRel) + 1;
-                self.hdr.startup_state.store(STARTUP_SINK_READY, Ordering::Release);
-                self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
-                resync_to_latest();
-                self.touch_consumer_heartbeat();
-                Ok(())
-            }
-            Err(_) => Err(ShmError::Protocol("another consumer already connected")),
-        }
-    }
-
-    pub fn release_consumer(&mut self, pid: u32) {
-        let _ = self.hdr.consumer_owner_pid.compare_exchange(
-            pid,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+    pub fn sync_startup_state(&mut self) {
+        // On attach, skip stale queued frames and start from the latest point.
+        let head = self.hdr.ready_head.load(Ordering::Acquire);
+        self.hdr.ready_tail.store(head, Ordering::Release);
+        self.hdr.timeline_gen.fetch_add(1, Ordering::AcqRel);
+        self.hdr.timeline_valid.store(0, Ordering::Release);
+        let _gen = self.hdr.startup_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        self.hdr.startup_state.store(STARTUP_SINK_READY, Ordering::Release);
+        self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
     }
 
     fn validate_bounds(&self, offset: u64, len: usize) -> Result<(), ShmError> {
@@ -930,7 +837,6 @@ fn init_header(
     recycle_offset: usize,
     arena_offset: usize,
     arena_size: u64,
-    wait_for_connection: bool,
     drop_when_no_consumer: bool,
 ) {
     hdr.magic = MAGIC;
@@ -941,11 +847,8 @@ fn init_header(
     hdr.features = 0;
     hdr.state.store(STATE_INIT, Ordering::Relaxed);
     hdr.owner_pid = std::process::id();
-    hdr.consumer_owner_pid.store(0, Ordering::Relaxed);
     hdr.epoch.store(1, Ordering::Relaxed);
-    hdr.producer_heartbeat_ns
-        .store(now_nanos(), Ordering::Relaxed);
-    hdr.consumer_heartbeat_ns.store(0, Ordering::Relaxed);
+    // Heartbeats and consumer ownership removed.
 
     hdr.ready_capacity = ready_capacity;
     hdr.ready_entry_size = size_of::<ReadyDesc>() as u32;
@@ -965,8 +868,6 @@ fn init_header(
     hdr.arena_used_bytes.store(0, Ordering::Relaxed);
     hdr.arena_high_watermark.store(0, Ordering::Relaxed);
     hdr.alloc_failures.store(0, Ordering::Relaxed);
-    hdr.wait_for_connection
-        .store(wait_for_connection as u32, Ordering::Relaxed);
     hdr.drop_when_no_consumer
         .store(drop_when_no_consumer as u32, Ordering::Relaxed);
     hdr.notify_mode.store(0, Ordering::Relaxed);
@@ -989,6 +890,9 @@ fn validate_header(hdr: &SharedHeader, total_size: u64) -> Result<(), ShmError> 
     }
     if hdr.version_major != VERSION_MAJOR {
         return Err(ShmError::Protocol("major version mismatch"));
+    }
+    if hdr.version_minor != VERSION_MINOR {
+        return Err(ShmError::Protocol("minor version mismatch"));
     }
     if hdr.total_size != total_size {
         return Err(ShmError::Protocol("mapped size mismatch"));

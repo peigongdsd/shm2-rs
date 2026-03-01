@@ -1,5 +1,4 @@
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -67,8 +66,6 @@ struct State {
     reader: Option<Arc<Mutex<ReaderType>>>,
     unlocked: bool,
     timeline: TimelineState,
-    hb_stop: Option<Arc<AtomicBool>>,
-    hb_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 struct ShmReadWrap {
@@ -310,15 +307,7 @@ mod imp {
                         ]
                     )
                 })?;
-            reader.claim_consumer(std::process::id()).map_err(|_| {
-                gst::error_msg!(
-                    gst::ResourceError::OpenRead,
-                    [
-                        "Another shm2src is already connected to {}",
-                        state.settings.shm_path
-                    ]
-                )
-            })?;
+            reader.sync_startup_state();
             self.obj().set_format(gst::Format::Time);
             let snap = reader.timeline_snapshot();
             let startup = reader.startup_snapshot();
@@ -338,31 +327,11 @@ mod imp {
             state.timeline.startup_snap_seq = snap.seq;
             state.timeline.saw_running = false;
 
-            if let Some(t) = state.hb_thread.take() {
-                let _ = t.join();
-            }
-            if let Some(reader_arc) = state.reader.as_ref().cloned() {
-                let stop = Arc::new(AtomicBool::new(false));
-                state.hb_stop = Some(stop.clone());
-                state.hb_thread = Some(std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        if let Ok(r) = reader_arc.lock() {
-                            r.consumer_heartbeat_tick();
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                }));
-            }
             Ok(())
         }
 
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
-            if let Some(reader) = state.reader.as_ref() {
-                if let Ok(mut r) = reader.lock() {
-                    r.release_consumer(std::process::id());
-                }
-            }
             state.reader = None;
             state.unlocked = false;
             state.timeline.expected_gen = 0;
@@ -377,12 +346,6 @@ mod imp {
             state.timeline.startup_ready_sent = false;
             state.timeline.startup_snap_seq = 0;
             state.timeline.saw_running = false;
-            if let Some(stop) = state.hb_stop.take() {
-                stop.store(true, Ordering::Relaxed);
-            }
-            if let Some(t) = state.hb_thread.take() {
-                let _ = t.join();
-            }
             Ok(())
         }
 

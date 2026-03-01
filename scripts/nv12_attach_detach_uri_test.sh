@@ -59,7 +59,7 @@ gst-launch-1.0 -q \
   videotestsrc is-live=true pattern=ball ! \
   video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
   queue ! \
-  shm2sink shm-path="${SHM_SPEC}" shm-size="${SHM_SIZE_BYTES}" wait-for-connection=true consumer-timeout-ms=1000 \
+  shm2sink shm-path="${SHM_SPEC}" shm-size="${SHM_SIZE_BYTES}" \
   >"${SINK_LOG}" 2>&1 &
 sink_pid=$!
 

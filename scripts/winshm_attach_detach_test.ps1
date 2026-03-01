@@ -59,7 +59,7 @@ try {
         "videotestsrc", "is-live=true", "pattern=ball", "!",
         "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1", "!",
         "queue", "!",
-        "shm2sink", "shm-path=$ShmPath", "shm-size=$ShmSizeBytes", "wait-for-connection=true", "consumer-timeout-ms=1000"
+        "shm2sink", "shm-path=$ShmPath", "shm-size=$ShmSizeBytes"
     )
     if (-not $DryRun) {
         $sinkProc = Start-Process -FilePath "gst-launch-1.0" -ArgumentList $sinkArgs -RedirectStandardOutput $sinkLogOut -RedirectStandardError $sinkLogErr -PassThru

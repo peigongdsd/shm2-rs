@@ -30,8 +30,6 @@ struct Settings {
     shm_path: String,
     shm_size: u64,
     perms: u32,
-    wait_for_connection: bool,
-    consumer_timeout_ms: u32,
     timeline_beacon_ms: u32,
 }
 
@@ -41,8 +39,6 @@ impl Default for Settings {
             shm_path: DEFAULT_PATH.to_string(),
             shm_size: 64 * 1024 * 1024,
             perms: 0o660,
-            wait_for_connection: true,
-            consumer_timeout_ms: 1000,
             timeline_beacon_ms: 250,
         }
     }
@@ -54,9 +50,6 @@ struct State {
     writer: Option<Arc<Mutex<WriterType>>>,
     allocator: Option<ShmArenaAllocator>,
     unlocked: bool,
-    was_consumer_online: bool,
-    hb_stop: Option<Arc<AtomicBool>>,
-    hb_thread: Option<std::thread::JoinHandle<()>>,
     gc_stop: Option<Arc<AtomicBool>>,
     gc_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -267,20 +260,6 @@ mod imp {
                         .maximum(0o7777)
                         .mutable_ready()
                         .build(),
-                    glib::ParamSpecBoolean::builder("wait-for-connection")
-                        .nick("Wait for connection")
-                        .blurb("Block rendering until a shm2src consumer is connected")
-                        .default_value(true)
-                        .mutable_ready()
-                        .build(),
-                    glib::ParamSpecUInt::builder("consumer-timeout-ms")
-                        .nick("Consumer timeout")
-                        .blurb("Consumer heartbeat timeout in milliseconds")
-                        .default_value(1000)
-                        .minimum(1)
-                        .maximum(60_000)
-                        .mutable_ready()
-                        .build(),
                     glib::ParamSpecUInt::builder("timeline-beacon-ms")
                         .nick("Timeline beacon")
                         .blurb("Timeline synchronization beacon period in milliseconds")
@@ -312,16 +291,6 @@ mod imp {
                         state.settings.perms = v;
                     }
                 }
-                "wait-for-connection" => {
-                    if let Ok(v) = value.get::<bool>() {
-                        state.settings.wait_for_connection = v;
-                    }
-                }
-                "consumer-timeout-ms" => {
-                    if let Ok(v) = value.get::<u32>() {
-                        state.settings.consumer_timeout_ms = v;
-                    }
-                }
                 "timeline-beacon-ms" => {
                     if let Ok(v) = value.get::<u32>() {
                         state.settings.timeline_beacon_ms = v.max(1);
@@ -337,8 +306,6 @@ mod imp {
                 "shm-path" => state.settings.shm_path.to_value(),
                 "shm-size" => state.settings.shm_size.to_value(),
                 "perms" => state.settings.perms.to_value(),
-                "wait-for-connection" => state.settings.wait_for_connection.to_value(),
-                "consumer-timeout-ms" => state.settings.consumer_timeout_ms.to_value(),
                 "timeline-beacon-ms" => state.settings.timeline_beacon_ms.to_value(),
                 _ => unreachable!(),
             }
@@ -418,23 +385,7 @@ mod imp {
             state.writer = Some(writer);
             state.allocator = Some(allocator);
             state.unlocked = false;
-            state.was_consumer_online = false;
 
-            if let Some(t) = state.hb_thread.take() {
-                let _ = t.join();
-            }
-            if let Some(writer_arc) = state.writer.as_ref().cloned() {
-                let stop = Arc::new(AtomicBool::new(false));
-                state.hb_stop = Some(stop.clone());
-                state.hb_thread = Some(std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        if let Ok(w) = writer_arc.lock() {
-                            w.producer_heartbeat_tick();
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                }));
-            }
             if let Some(t) = state.gc_thread.take() {
                 let _ = t.join();
             }
@@ -455,12 +406,6 @@ mod imp {
 
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
-            if let Some(stop) = state.hb_stop.take() {
-                stop.store(true, Ordering::Relaxed);
-            }
-            if let Some(t) = state.hb_thread.take() {
-                let _ = t.join();
-            }
             if let Some(stop) = state.gc_stop.take() {
                 stop.store(true, Ordering::Relaxed);
             }
@@ -475,14 +420,12 @@ mod imp {
             state.allocator = None;
             state.writer = None;
             state.unlocked = false;
-            state.was_consumer_online = false;
             Ok(())
         }
 
         fn render(&self, buffer: &gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
             let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
             let pts_ns = buffer.pts().map(|v| v.nseconds() as i64).unwrap_or(-1);
-            let mut idle_no_consumer = 0u32;
             let mut idle_no_space = 0u32;
 
             loop {
@@ -490,32 +433,12 @@ mod imp {
                 if state.unlocked {
                     return Err(gst::FlowError::Flushing);
                 }
-                let wait_for_connection = state.settings.wait_for_connection;
-                let timeout_ns = (state.settings.consumer_timeout_ms as u64) * 1_000_000;
                 let writer = state
                     .writer
                     .as_ref()
                     .cloned()
                     .ok_or(gst::FlowError::Flushing)?;
                 let allocator = state.allocator.as_ref().cloned();
-
-                let online = {
-                    let w = writer.lock().map_err(|_| gst::FlowError::Error)?;
-                    w.is_consumer_online(timeout_ns)
-                };
-                if online != state.was_consumer_online {
-                    eprintln!(
-                        "[shm2] consumer_online {} -> {} (timeout_ns={})",
-                        state.was_consumer_online, online, timeout_ns
-                    );
-                }
-                state.was_consumer_online = online;
-
-                if wait_for_connection && !online {
-                    drop(state);
-                    poll_yield_sleep(&mut idle_no_consumer, Duration::from_millis(5));
-                    continue;
-                }
 
                 {
                     let mut w = writer.lock().map_err(|_| gst::FlowError::Error)?;
@@ -565,16 +488,6 @@ mod imp {
                                             writer.lock().map_err(|_| gst::FlowError::Error)?;
                                         match w.publish_lease(lease, pts_ns) {
                                             Ok(_) => fast_published = true,
-                                            Err(crate::platform::ShmError::NoConsumer)
-                                                if wait_for_connection =>
-                                            {
-                                                drop(state);
-                                                poll_yield_sleep(
-                                                    &mut idle_no_consumer,
-                                                    Duration::from_millis(5),
-                                                );
-                                                continue;
-                                            }
                                             Err(crate::platform::ShmError::Exhausted) => {
                                                 drop(state);
                                                 poll_yield_sleep(
@@ -602,10 +515,6 @@ mod imp {
                     Err(crate::platform::ShmError::Exhausted) => {
                         drop(state);
                         poll_yield_sleep(&mut idle_no_space, Duration::from_millis(1));
-                    }
-                    Err(crate::platform::ShmError::NoConsumer) if wait_for_connection => {
-                        drop(state);
-                        poll_yield_sleep(&mut idle_no_consumer, Duration::from_millis(5));
                     }
                     Err(_) => return Err(gst::FlowError::Error),
                 }
