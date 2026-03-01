@@ -1,22 +1,26 @@
 use std::thread;
 use std::time::Duration;
 
-use gstshm2::platform::posix_file::PosixFileBackend;
+use gstshm2::platform::resolve_backend;
 use gstshm2::transport::Reader;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    let default_path = "/dev/shm/gst-shm2-demo";
+    #[cfg(windows)]
+    let default_path = "winshm://Local/gst-shm2-demo";
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/dev/shm/gst-shm2-demo".to_string());
+        .unwrap_or_else(|| default_path.to_string());
     let max = std::env::args()
         .nth(2)
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(5000);
 
-    let backend = PosixFileBackend;
+    let selected = resolve_backend(&path)?;
 
     let mut reader = loop {
-        match Reader::open(&backend, &path) {
+        match Reader::open(selected.backend.as_ref(), &selected.name) {
             Ok(r) => break r,
             Err(_) => {
                 thread::sleep(Duration::from_millis(50));

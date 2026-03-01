@@ -1,11 +1,11 @@
 SHM-Only GStreamer Transport Design (for future ivshmem use)
 ============================================================
 
-Status: Design + implemented-state reference (updated March 1, 2026)
+Status: Design + implemented-state reference (updated March 1, 2026; backend decoupling and winshm implementation added)
 Target language: Rust
 Elements: shm2sink (writer), shm2src (reader)
-Constraint: src/sink communication depends ONLY on one shared memory file at /dev/shm/xxx
-Portability constraint: implementation must isolate minimal OS API layer to support Windows named shared memory later
+Constraint: src/sink communication depends ONLY on one shared memory mapped region selected by shm-path backend
+Portability constraint: implementation isolates minimal OS API layer for Linux and Windows backend swap without protocol changes
 
 Implementation snapshot (March 1, 2026)
 - Implemented in `/home/krusl/code/gst-shm/shm2-rs`.
@@ -14,6 +14,11 @@ Implementation snapshot (March 1, 2026)
 - `shm2sink` retains copy fallback for non-cooperating upstream memory.
 - Single-consumer ownership is enforced (`claim_consumer`/`release_consumer`).
 - Sink connection behavior is heartbeat-based (`wait-for-connection`, `consumer-timeout-ms`).
+- Platform/backend decoupling is implemented end-to-end in plugin + transport:
+  - backend is resolved from `shm-path` at runtime
+  - transport uses backend trait objects (no backend generics in element code)
+- Windows named shared memory backend is implemented (`winshm://...`) using Win32 mapping APIs.
+- Windows default namespace is `Local\\...` for non-admin reliability; `Global\\...` is supported when privilege allows.
 
 
 0. Goals and Non-Goals
@@ -88,7 +93,9 @@ This ensures we can replace Linux `/dev/shm` backend with Windows named shared m
 -------------------------------
 
 Path convention
-- Property: shm-path (default example: /dev/shm/gst-shm2-default)
+- Property: shm-path (backend-aware; examples below)
+- Linux default: `/dev/shm/gst-shm2-default`
+- Windows default: `winshm://Local/gst-shm2-default`
 
 Creator
 - shm2sink is owner/creator in MVP.
@@ -108,10 +115,15 @@ Cleanup
   - keep-file=false unlink on owner shutdown
 - For ivshmem future, "unlink" likely not used; region is provided by platform.
 
-Windows equivalent (future)
-- Name convention uses a shared memory object name (for example `Global\\gst-shm2-default`).
-- Creator/attacher semantics match Linux owner/attacher roles, but implemented via Win32 mapping APIs.
-- No protocol change required.
+Windows equivalent (implemented)
+- Name convention uses a named mapping object (for example `Local\\gst-shm2-default` or `Global\\gst-shm2-default`).
+- Creator/attacher semantics match Linux owner/attacher roles, implemented via:
+  - `CreateFileMappingW` / `OpenFileMappingW`
+  - `MapViewOfFile` / `UnmapViewOfFile`
+- No protocol change is required.
+- Practical note:
+  - `Global\\...` may require elevated privilege/service context.
+  - Defaulting to `Local\\...` avoids privilege-related startup failure for normal users.
 
 
 4. Memory Map Layout
@@ -448,9 +460,9 @@ Endian
 
 Create a strict backend trait used by protocol + plugin layers.
 
-Trait sketch (conceptual)
-- `create(name, size, perms) -> Mapping`
-- `open(name) -> Mapping`
+Trait sketch (implemented shape)
+- `create(name, size, perms) -> Box<dyn SharedRegion>`
+- `open(name) -> Box<dyn SharedRegion>`
 - `mapping.as_ptr() / len()`
 - `flush(optional)`
 - `close()`
@@ -465,18 +477,22 @@ Mapping abstraction
 - Guarantees page-aligned mapping and valid lifetime.
 
 Backends
-- `backend_posix_shm` (Linux now):
-  - shm_open, ftruncate, mmap, munmap, shm_unlink
-- `backend_win_named_shm` (Windows later):
+- `backend_posix_file` (Linux now):
+  - open/ftruncate/mmap/munmap/close over `/dev/shm/...` file paths
+- `backend_win_named_shm` (Windows now):
   - CreateFileMapping/OpenFileMapping, MapViewOfFile, UnmapViewOfFile, CloseHandle
 - `backend_ivshmem` (future optional):
   - map existing device region and optional doorbell hooks
 
 Backend selection
-- Compile-time feature flags plus runtime selection by URI-like name:
-  - `shm://gst-shm2-default` -> POSIX backend
-  - `winshm://Global/gst-shm2-default` -> Windows backend
+- Runtime selection by URI-like name (implemented):
+  - `shm:///dev/shm/gst-shm2-default` -> Linux POSIX file backend
+  - `winshm://Local/gst-shm2-default` -> Windows named backend
+  - `winshm://Global/gst-shm2-default` -> Windows named backend (privilege-dependent)
   - `ivshmem://region0` -> ivshmem backend
+- Backward-compat behavior:
+  - plain absolute Linux path (for example `/dev/shm/...`) resolves to POSIX backend on unix
+  - plain Windows name resolves to named backend on windows
 - Protocol layer only sees bytes + atomics, not backend-specific handles.
 
 Minimal OS-dependent surface
@@ -509,6 +525,10 @@ Integration tests (single host)
 - no-consumer mode behavior.
 - src late join/leave.
 - sink restart with epoch increment.
+- Added backend-specific attach/detach scripts:
+  - `scripts/nv12_attach_detach_test.sh` (legacy path style)
+  - `scripts/nv12_attach_detach_uri_test.sh` (`shm://` URI path style)
+  - `scripts/winshm_attach_detach_test.ps1` (`winshm://` on Windows)
 
 Stress tests
 - random buffer sizes and burst patterns.
@@ -578,12 +598,16 @@ Completed
 - `shm2sink` custom allocator + `propose_allocation` fast path + copy fallback.
 - Heartbeat-based wait semantics (`wait-for-connection`, `consumer-timeout-ms`).
 - Single active consumer enforcement at protocol layer.
+- Runtime backend resolution from `shm-path` in plugin and test binaries.
+- Transport backend decoupling via trait objects (`Box<dyn SharedRegion>`, `&dyn ShmBackend`).
+- Windows named shared memory backend implementation.
+- Windows attach/detach integration test pass with `winshm://Local/...`.
 
 Not completed yet
 - Optional futex optimization.
 - Robust crash-recovery epoch refinements beyond current heartbeat ownership model.
-- Windows named shared memory backend.
 - ivshmem-specific notifier integration.
+- Automated CI matrix for Linux + Windows gst integration runs.
 
 
 22. Platform-Decoupling Acceptance Criteria
@@ -705,6 +729,12 @@ Implemented objective
 - Present automated unit tests cover allocator coalescing and descriptor alignment.
 - Manual/integration runs cover end-to-end pipeline operation, single-consumer rejection, and attach/detach blocking behavior.
 - Added script-level integration test (`shm2-rs/scripts/nv12_attach_detach_test.sh`) for NV12 1920x1080@30 with repeated source attach/detach.
+- Added script-level URI/backends tests:
+  - `shm2-rs/scripts/nv12_attach_detach_uri_test.sh` for `shm://` selection on Linux.
+  - `shm2-rs/scripts/winshm_attach_detach_test.ps1` for `winshm://` selection on Windows.
+- Observed runtime note on Windows:
+  - `winshm://Global/...` can fail with access denied in non-elevated contexts.
+  - `winshm://Local/...` is the default and is verified in full attach/detach run.
 - Gap: no automated assertion yet that sink fast path is selected vs fallback copy.
 - Gap: no long soak/fault-injection CI test matrix yet.
 
@@ -712,7 +742,7 @@ Implemented objective
 1. Add explicit instrumentation/counters for sink fast-path hit rate vs fallback copy.
 2. Add automated gst integration tests to CI (including attach/detach and disconnect races).
 3. Add long-duration soak + crash/restart fault-injection tests.
-4. Add Windows backend using current platform abstraction.
+4. Add ivshmem backend using the current platform abstraction.
 
 
 21. Hard Constraints Checklist
@@ -722,7 +752,7 @@ Communication dependency checklist
 - [x] No Unix socket
 - [x] No pipe
 - [x] No external control channel required
-- [x] Control + data both in /dev/shm/xxx
+- [x] Control + data both in one mapped shared-memory region (backend-selected)
 - [x] Poll-only mode exists for cross-VM compatibility
 
-This satisfies your requirement that src and sink communicate only through the shared memory file.
+This satisfies the requirement that src and sink communicate only through one shared-memory mapping.

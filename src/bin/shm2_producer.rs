@@ -1,14 +1,17 @@
 use std::thread;
 use std::time::Duration;
 
-use gstshm2::platform::ShmError;
-use gstshm2::platform::posix_file::PosixFileBackend;
+use gstshm2::platform::{ShmError, resolve_backend};
 use gstshm2::transport::{TransportConfig, Writer};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    let default_path = "/dev/shm/gst-shm2-demo";
+    #[cfg(windows)]
+    let default_path = "winshm://Local/gst-shm2-demo";
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/dev/shm/gst-shm2-demo".to_string());
+        .unwrap_or_else(|| default_path.to_string());
     let count = std::env::args()
         .nth(2)
         .and_then(|s| s.parse::<usize>().ok())
@@ -17,8 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cfg = TransportConfig::default();
     cfg.total_size = 64 * 1024 * 1024;
 
-    let backend = PosixFileBackend;
-    let mut writer = Writer::create(&backend, &path, cfg)?;
+    let selected = resolve_backend(&path)?;
+    let mut writer = Writer::create(selected.backend.as_ref(), &selected.name, cfg)?;
     writer.set_running();
 
     println!(

@@ -106,21 +106,26 @@ impl PosixFileBackend {
 }
 
 impl ShmBackend for PosixFileBackend {
-    type Region = PosixFileRegion;
-
-    fn create(&self, name: &str, size: usize, perms: u32) -> Result<Self::Region, ShmError> {
+    fn create(
+        &self,
+        name: &str,
+        size: usize,
+        perms: u32,
+    ) -> Result<Box<dyn SharedRegion>, ShmError> {
         if size == 0 {
             return Err(ShmError::InvalidConfig("size must be non-zero"));
         }
-        self.open_internal(
+        let region = self.open_internal(
             name,
             libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
             perms,
             Some(size),
-        )
+        )?;
+        Ok(Box::new(region))
     }
 
-    fn open(&self, name: &str) -> Result<Self::Region, ShmError> {
-        self.open_internal(name, libc::O_RDWR | libc::O_CLOEXEC, 0, None)
+    fn open(&self, name: &str) -> Result<Box<dyn SharedRegion>, ShmError> {
+        let region = self.open_internal(name, libc::O_RDWR | libc::O_CLOEXEC, 0, None)?;
+        Ok(Box::new(region))
     }
 }

@@ -120,8 +120,8 @@ impl Default for TransportConfig {
     }
 }
 
-pub struct Writer<B: ShmBackend> {
-    region: B::Region,
+pub struct Writer {
+    region: Box<dyn SharedRegion>,
     hdr: &'static SharedHeader,
     ready: &'static mut [ReadyDesc],
     recycle: &'static mut [RecycleDesc],
@@ -130,8 +130,8 @@ pub struct Writer<B: ShmBackend> {
     allocator_align: u64,
 }
 
-pub struct Reader<B: ShmBackend> {
-    _region: B::Region,
+pub struct Reader {
+    _region: Box<dyn SharedRegion>,
     hdr: &'static SharedHeader,
     ready: &'static mut [ReadyDesc],
     recycle: &'static mut [RecycleDesc],
@@ -139,8 +139,8 @@ pub struct Reader<B: ShmBackend> {
 }
 
 // Writer/Reader are guarded externally by element mutexes.
-unsafe impl<B: ShmBackend> Send for Writer<B> {}
-unsafe impl<B: ShmBackend> Send for Reader<B> {}
+unsafe impl Send for Writer {}
+unsafe impl Send for Reader {}
 
 #[derive(Debug)]
 pub struct ReceivedBuffer {
@@ -174,8 +174,12 @@ pub struct AllocLease {
     pub ptr: *mut u8,
 }
 
-impl<B: ShmBackend> Writer<B> {
-    pub fn create(backend: &B, path: &str, cfg: TransportConfig) -> Result<Self, ShmError> {
+impl Writer {
+    pub fn create(
+        backend: &dyn ShmBackend,
+        path: &str,
+        cfg: TransportConfig,
+    ) -> Result<Self, ShmError> {
         if cfg.ready_capacity == 0 || cfg.recycle_capacity == 0 {
             return Err(ShmError::InvalidConfig("ring capacities must be non-zero"));
         }
@@ -353,8 +357,8 @@ impl<B: ShmBackend> Writer<B> {
     }
 }
 
-impl<B: ShmBackend> Reader<B> {
-    pub fn open(backend: &B, path: &str) -> Result<Self, ShmError> {
+impl Reader {
+    pub fn open(backend: &dyn ShmBackend, path: &str) -> Result<Self, ShmError> {
         let region = backend.open(path)?;
 
         let hdr = unsafe { &*(region.as_ptr().as_ptr() as *const SharedHeader) };

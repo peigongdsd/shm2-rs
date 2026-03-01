@@ -12,12 +12,15 @@ use gstreamer as gst;
 use gstreamer_base as gst_base;
 use once_cell::sync::Lazy;
 
-use crate::platform::posix_file::PosixFileBackend;
+use crate::platform::resolve_backend;
 use crate::transport::{Reader, ReceivedDesc};
 
-type ReaderType = Reader<PosixFileBackend>;
+type ReaderType = Reader;
 
+#[cfg(unix)]
 const DEFAULT_PATH: &str = "/dev/shm/gst-shm2-default";
+#[cfg(windows)]
+const DEFAULT_PATH: &str = "winshm://Local/gst-shm2-default";
 
 #[derive(Debug)]
 struct Settings {
@@ -166,17 +169,24 @@ mod imp {
     impl BaseSrcImpl for Shm2Src {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
-            let backend = PosixFileBackend;
-            let mut reader = Reader::open(&backend, &state.settings.shm_path).map_err(|err| {
+            let selected = resolve_backend(&state.settings.shm_path).map_err(|err| {
                 gst::error_msg!(
-                    gst::ResourceError::OpenRead,
-                    [
-                        "Failed to open shm reader at {}: {}",
-                        state.settings.shm_path,
-                        err
-                    ]
+                    gst::ResourceError::Settings,
+                    ["Invalid shm-path '{}': {}", state.settings.shm_path, err]
                 )
             })?;
+            let mut reader =
+                Reader::open(selected.backend.as_ref(), &selected.name).map_err(|err| {
+                    gst::error_msg!(
+                        gst::ResourceError::OpenRead,
+                        [
+                            "Failed to open shm reader at {} (resolved '{}'): {}",
+                            state.settings.shm_path,
+                            selected.name,
+                            err
+                        ]
+                    )
+                })?;
             reader.claim_consumer(std::process::id()).map_err(|_| {
                 gst::error_msg!(
                     gst::ResourceError::OpenRead,

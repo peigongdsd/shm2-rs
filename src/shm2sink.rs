@@ -12,12 +12,15 @@ use gstreamer as gst;
 use gstreamer_base as gst_base;
 use once_cell::sync::Lazy;
 
-use crate::platform::posix_file::PosixFileBackend;
+use crate::platform::resolve_backend;
 use crate::transport::{AllocLease, TransportConfig, Writer};
 
-type WriterType = Writer<PosixFileBackend>;
+type WriterType = Writer;
 
+#[cfg(unix)]
 const DEFAULT_PATH: &str = "/dev/shm/gst-shm2-default";
+#[cfg(windows)]
+const DEFAULT_PATH: &str = "winshm://Local/gst-shm2-default";
 
 #[derive(Debug)]
 struct Settings {
@@ -347,14 +350,20 @@ mod imp {
                 ..Default::default()
             };
 
-            let backend = PosixFileBackend;
+            let selected = resolve_backend(&state.settings.shm_path).map_err(|err| {
+                gst::error_msg!(
+                    gst::ResourceError::Settings,
+                    ["Invalid shm-path '{}': {}", state.settings.shm_path, err]
+                )
+            })?;
             let writer =
-                Writer::create(&backend, &state.settings.shm_path, cfg).map_err(|err| {
+                Writer::create(selected.backend.as_ref(), &selected.name, cfg).map_err(|err| {
                     gst::error_msg!(
                         gst::ResourceError::OpenReadWrite,
                         [
-                            "Failed to create shm writer at {}: {}",
+                            "Failed to create shm writer at {} (resolved '{}'): {}",
                             state.settings.shm_path,
+                            selected.name,
                             err
                         ]
                     )
