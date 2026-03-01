@@ -52,6 +52,7 @@ struct State {
     writer: Option<Arc<Mutex<WriterType>>>,
     allocator: Option<ShmArenaAllocator>,
     unlocked: bool,
+    was_consumer_online: bool,
     hb_stop: Option<Arc<AtomicBool>>,
     hb_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -411,6 +412,7 @@ mod imp {
             state.writer = Some(writer);
             state.allocator = Some(allocator);
             state.unlocked = false;
+            state.was_consumer_online = false;
 
             if let Some(t) = state.hb_thread.take() {
                 let _ = t.join();
@@ -446,6 +448,7 @@ mod imp {
             state.allocator = None;
             state.writer = None;
             state.unlocked = false;
+            state.was_consumer_online = false;
             Ok(())
         }
 
@@ -469,12 +472,19 @@ mod imp {
                     .ok_or(gst::FlowError::Flushing)?;
                 let allocator = state.allocator.as_ref().cloned();
 
-                if wait_for_connection
-                    && !writer
-                        .lock()
-                        .map_err(|_| gst::FlowError::Error)?
-                        .is_consumer_online(timeout_ns)
-                {
+                let online = {
+                    let mut w = writer.lock().map_err(|_| gst::FlowError::Error)?;
+                    let is_online = w.is_consumer_online(timeout_ns);
+                    if !is_online && state.was_consumer_online {
+                        // Consumer went away without recycling outstanding buffers.
+                        // Reclaim arena to avoid permanent allocator exhaustion.
+                        w.reset_allocator_state();
+                    }
+                    is_online
+                };
+                state.was_consumer_online = online;
+
+                if wait_for_connection && !online {
                     drop(state);
                     poll_yield_sleep(&mut idle_no_consumer, Duration::from_millis(5));
                     continue;

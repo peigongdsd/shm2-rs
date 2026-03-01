@@ -1,5 +1,4 @@
 use std::mem::size_of;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,25 +28,6 @@ fn poll_yield_sleep(idle_cycles: &mut u32, steady_sleep: Duration) {
     };
     thread::sleep(sleep_for);
     *idle_cycles = idle_cycles.saturating_add(1);
-}
-
-fn debug_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let on = std::env::var("SHM2_DEBUG")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if on {
-            eprintln!("[shm2-debug] enabled pid={}", std::process::id());
-        }
-        on
-    })
-}
-
-fn dlog(msg: impl AsRef<str>) {
-    if debug_enabled() {
-        eprintln!("[shm2-debug] {}", msg.as_ref());
-    }
 }
 
 #[repr(C, align(64))]
@@ -298,6 +278,13 @@ impl Writer {
         self.drain_recycles();
         let alloc = self.allocator.alloc(size, align).ok_or_else(|| {
             self.hdr.alloc_failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[shm2] allocator exhausted: used_bytes={} arena_size={} size={} align={}",
+                self.allocator.used_bytes(),
+                self.hdr.arena_size,
+                size,
+                align
+            );
             ShmError::Exhausted
         })?;
         let ptr = unsafe { self.arena.add(alloc.offset as usize) };
@@ -319,13 +306,6 @@ impl Writer {
 
     pub fn publish_lease(&mut self, lease: AllocLease, pts_ns: i64) -> Result<(), ShmError> {
         if !self.is_consumer_online(1_000_000_000) {
-            let owner = self.hdr.consumer_owner_pid.load(Ordering::Acquire);
-            let hb = self.hdr.consumer_heartbeat_ns.load(Ordering::Acquire);
-            let now = now_nanos();
-            dlog(format!(
-                "publish_lease NoConsumer owner={owner} hb_ns={hb} age_ns={} timeout_ns=1000000000",
-                now.saturating_sub(hb)
-            ));
             return Err(ShmError::NoConsumer);
         }
         let mut idle_cycles = 0u32;
@@ -393,25 +373,14 @@ impl Writer {
     pub fn is_consumer_online(&self, timeout_ns: u64) -> bool {
         let owner = self.hdr.consumer_owner_pid.load(Ordering::Acquire);
         if owner == 0 {
-            dlog(format!(
-                "is_consumer_online=false owner=0 timeout_ns={timeout_ns}"
-            ));
             return false;
         }
         let hb = self.hdr.consumer_heartbeat_ns.load(Ordering::Acquire);
         if hb == 0 {
-            dlog(format!(
-                "is_consumer_online=false owner={owner} hb=0 timeout_ns={timeout_ns}"
-            ));
             return false;
         }
         let age = now_nanos().saturating_sub(hb);
         let online = age <= timeout_ns;
-        if !online {
-            dlog(format!(
-                "is_consumer_online=false owner={owner} hb_age_ns={age} timeout_ns={timeout_ns}"
-            ));
-        }
         online
     }
 
@@ -440,6 +409,17 @@ impl Writer {
                 Err(v) => prev_hw = v,
             }
         }
+    }
+
+    pub fn reset_allocator_state(&mut self) {
+        self.allocator = FreeListAllocator::new(self.hdr.arena_size);
+        self.hdr.ready_head.store(0, Ordering::Relaxed);
+        self.hdr.ready_tail.store(0, Ordering::Relaxed);
+        self.hdr.rec_head.store(0, Ordering::Relaxed);
+        self.hdr.rec_tail.store(0, Ordering::Relaxed);
+        self.hdr.arena_used_bytes.store(0, Ordering::Relaxed);
+        self.hdr.arena_high_watermark.store(0, Ordering::Relaxed);
+        self.hdr.alloc_failures.store(0, Ordering::Relaxed);
     }
 
     fn maybe_publish_timeline_snapshot(&mut self, producer_pts_ns: i64, ready_head: u64) {
@@ -652,12 +632,6 @@ impl Reader {
                 self.hdr.timeline_valid.store(0, Ordering::Release);
                 resync_to_latest();
                 self.touch_consumer_heartbeat();
-                let generation = self.hdr.timeline_gen.load(Ordering::Acquire);
-                let head = self.hdr.ready_head.load(Ordering::Acquire);
-                let tail = self.hdr.ready_tail.load(Ordering::Acquire);
-                dlog(format!(
-                    "claim_consumer ok pid={pid} generation={generation} ready_head={head} ready_tail={tail}"
-                ));
                 Ok(())
             }
             Err(current) if current == pid => {
@@ -665,39 +639,19 @@ impl Reader {
                 self.hdr.timeline_valid.store(0, Ordering::Release);
                 resync_to_latest();
                 self.touch_consumer_heartbeat();
-                let generation = self.hdr.timeline_gen.load(Ordering::Acquire);
-                let head = self.hdr.ready_head.load(Ordering::Acquire);
-                let tail = self.hdr.ready_tail.load(Ordering::Acquire);
-                dlog(format!(
-                    "claim_consumer refresh pid={pid} generation={generation} ready_head={head} ready_tail={tail}"
-                ));
                 Ok(())
             }
-            Err(current) => {
-                let hb = self.hdr.consumer_heartbeat_ns.load(Ordering::Acquire);
-                let now = now_nanos();
-                dlog(format!(
-                    "claim_consumer rejected pid={pid} current_owner={current} hb_ns={hb} age_ns={}",
-                    now.saturating_sub(hb)
-                ));
-                Err(ShmError::Protocol("another consumer already connected"))
-            }
+            Err(_) => Err(ShmError::Protocol("another consumer already connected")),
         }
     }
 
     pub fn release_consumer(&mut self, pid: u32) {
-        let res = self.hdr.consumer_owner_pid.compare_exchange(
+        let _ = self.hdr.consumer_owner_pid.compare_exchange(
             pid,
             0,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        match res {
-            Ok(_) => dlog(format!("release_consumer ok pid={pid}")),
-            Err(current) => dlog(format!(
-                "release_consumer ignored pid={pid} current_owner={current}"
-            )),
-        }
     }
 
     fn validate_bounds(&self, offset: u64, len: usize) -> Result<(), ShmError> {
