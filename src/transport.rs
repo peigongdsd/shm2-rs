@@ -658,17 +658,22 @@ impl Reader {
         let len = head.saturating_sub(tail);
         let mut dropped = 0u64;
         let mut chosen = tail;
-        // Vsync-friendly live policy:
+        // Live policy (newest):
         // len==1 -> consume oldest
-        // len==2 -> consume oldest
-        // len>=3 -> drop oldest, consume next (2nd)
-        if len >= 3 {
-            let oldest_idx = (tail % cap) as usize;
-            let oldest = self.ready[oldest_idx];
-            if self.try_recycle_desc(oldest.buffer_id, oldest.offset, oldest.length, 1) {
-                dropped = 1;
-                chosen = tail + 1;
+        // len>=2 -> consume newest, drop everything older
+        if len >= 2 {
+            let mut cur = tail;
+            let stop = head - 1;
+            while cur < stop {
+                let idx = (cur % cap) as usize;
+                let desc = self.ready[idx];
+                if !self.try_recycle_desc(desc.buffer_id, desc.offset, desc.length, 1) {
+                    break;
+                }
+                dropped += 1;
+                cur += 1;
             }
+            chosen = head - 1;
         }
 
         let chosen_idx = (chosen % cap) as usize;
@@ -686,8 +691,9 @@ impl Reader {
 
         self.validate_bounds(out.offset, out.len as usize)?;
 
-        // Advance tail past the consumed entry (and any dropped oldest entry).
-        self.hdr.ready_tail.store(chosen + 1, Ordering::Release);
+        // Advance tail to skip everything up to the chosen entry (and any dropped oldest entry).
+        let new_tail = if chosen >= tail { chosen + 1 } else { head };
+        self.hdr.ready_tail.store(new_tail, Ordering::Release);
         self.touch_consumer_heartbeat();
         Ok(Some((out, dropped)))
     }
