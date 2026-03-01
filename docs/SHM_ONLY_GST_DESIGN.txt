@@ -1,0 +1,728 @@
+SHM-Only GStreamer Transport Design (for future ivshmem use)
+============================================================
+
+Status: Design + implemented-state reference (updated March 1, 2026)
+Target language: Rust
+Elements: shm2sink (writer), shm2src (reader)
+Constraint: src/sink communication depends ONLY on one shared memory file at /dev/shm/xxx
+Portability constraint: implementation must isolate minimal OS API layer to support Windows named shared memory later
+
+Implementation snapshot (March 1, 2026)
+- Implemented in `/home/krusl/code/gst-shm/shm2-rs`.
+- `shm2src` output zero-copy is implemented (SHM-backed readonly memory with recycle-on-drop).
+- `shm2sink` upstream zero-copy fast path is implemented via `propose_allocation` + custom allocator.
+- `shm2sink` retains copy fallback for non-cooperating upstream memory.
+- Single-consumer ownership is enforced (`claim_consumer`/`release_consumer`).
+- Sink connection behavior is heartbeat-based (`wait-for-connection`, `consumer-timeout-ms`).
+
+
+0. Goals and Non-Goals
+----------------------
+
+Goals
+- Replace socket-based control path used by existing shmsink/shmsrc.
+- Keep all control + payload communication inside one mapped region (/dev/shm/xxx).
+- Preserve shmsink/shmsrc behavior as much as practical:
+  - zero-copy path when upstream allocates from sink allocator
+  - refcount-like lifetime via explicit ACK/recycle protocol
+  - backpressure behavior
+- Be compatible with future inter-VM shared memory (ivshmem) by avoiding dependencies on Unix domain sockets.
+
+Non-Goals (MVP)
+- Multi-producer or multi-consumer in one region.
+- Dynamic SHM resize while running.
+- Arbitrary metadata transport beyond core timing/flags.
+- Hard real-time guarantees.
+
+
+1. High-Level Architecture
+--------------------------
+
+One file: /dev/shm/<name>
+Mapped by both processes (sink and src) with MAP_SHARED.
+
+Inside the mapped area:
+- Header: fixed-size control block + global state/version.
+- Ready ring: producer -> consumer descriptors (new buffers available).
+- Recycle ring: consumer -> producer descriptors (buffers released by src).
+- Data arena: payload bytes.
+
+No socket, no pipe, no eventfd is required for correctness.
+All state transitions are represented by atomics in this one memory region.
+
+
+2. Why This Satisfies Future ivshmem Direction
+----------------------------------------------
+
+Your future case is cross-VM over shared memory. Unix sockets are host-kernel IPC and do not cross VMs.
+This design keeps the protocol memory-native:
+- sequence counters
+- ring slots
+- allocator state
+- peer liveness heartbeats
+
+Notification model for portability:
+- Required: polling (works everywhere shared memory works).
+- Optional on same kernel host: futex wait/wake.
+- Optional on ivshmem: doorbell interrupt integration if available.
+
+Therefore protocol semantics are transport-agnostic and already suitable for ivshmem.
+
+
+2.1 Cross-Platform Architecture Constraint (Linux + Windows)
+------------------------------------------------------------
+
+Core rule
+- Keep protocol, rings, allocator, and GStreamer behavior fully OS-agnostic.
+- Put only "map/open/resize/unmap/permissions/optional notify primitive" in thin backend modules.
+
+What must NOT leak out of backend
+- Raw file descriptors / HANDLE semantics.
+- Linux-only path assumptions beyond backend.
+- mmap/MapViewOfFile-specific lifetime details.
+
+This ensures we can replace Linux `/dev/shm` backend with Windows named shared memory backend without changing protocol logic.
+
+
+3. File Ownership and Lifecycle
+-------------------------------
+
+Path convention
+- Property: shm-path (default example: /dev/shm/gst-shm2-default)
+
+Creator
+- shm2sink is owner/creator in MVP.
+- Create/open with O_CREAT|O_RDWR and configured perms.
+- ftruncate to total-size.
+- mmap shared R/W.
+- Initialize header if magic/version absent.
+
+Attacher
+- shm2src opens existing file O_RDWR (or O_RDONLY if implemented carefully; R/W simpler for recycle ring writes).
+- Verifies magic/version/endianness/features.
+
+Cleanup
+- On graceful sink stop, mark STATE_STOPPED in header.
+- File unlink policy configurable:
+  - keep-file=true for debugging/reconnect
+  - keep-file=false unlink on owner shutdown
+- For ivshmem future, "unlink" likely not used; region is provided by platform.
+
+Windows equivalent (future)
+- Name convention uses a shared memory object name (for example `Global\\gst-shm2-default`).
+- Creator/attacher semantics match Linux owner/attacher roles, but implemented via Win32 mapping APIs.
+- No protocol change required.
+
+
+4. Memory Map Layout
+--------------------
+
+All offsets are byte offsets from base address of mmap.
+All atomics are little-endian, naturally aligned.
+
+Region
+- [Header][ReadyRing][RecycleRing][Arena]
+
+Alignment
+- Header aligned to 4096 bytes.
+- Ring entries aligned to 64 bytes (cacheline).
+- Arena aligned to 4096 bytes.
+
+Suggested default sizes
+- Total size: 64 MiB (configurable)
+- Header: 4 KiB
+- Ready ring: 4096 entries * 64 bytes = 256 KiB
+- Recycle ring: 4096 entries * 64 bytes = 256 KiB
+- Arena: remainder
+
+
+5. Header Definition (Conceptual)
+---------------------------------
+
+Fields (fixed offsets; do not use Rust repr-default):
+- magic[8] = "GSTSHM2\0"
+- version_major (u16)
+- version_minor (u16)
+- header_size (u32)
+- total_size (u64)
+- features (u64 bitmask)
+- state (u32): INIT, RUNNING, STOPPING, STOPPED, ERROR
+- owner_pid (u32) (debug)
+- epoch (u64): increment on sink re-init to invalidate stale attachments
+- producer_heartbeat_ns (u64)
+- consumer_heartbeat_ns (u64)
+
+Ready ring control:
+- ready_capacity (u32)
+- ready_entry_size (u32)
+- ready_head (u64)  // producer writes
+- ready_tail (u64)  // consumer writes
+
+Recycle ring control:
+- rec_capacity (u32)
+- rec_entry_size (u32)
+- rec_head (u64)    // consumer writes
+- rec_tail (u64)    // producer writes
+
+Arena:
+- arena_offset (u64)
+- arena_size (u64)
+
+Allocator shared diagnostics (not authoritative for allocation logic):
+- arena_used_bytes (u64)
+- arena_high_watermark (u64)
+- alloc_failures (u64)
+
+Behavior flags:
+- wait_for_connection (u32 bool)
+- drop_when_no_consumer (u32 bool)
+- notify_mode (u32): POLL_ONLY, FUTEX_HINT, IVSHMEM_DOORBELL_HINT
+
+
+6. Descriptor Formats
+---------------------
+
+6.1 ReadyDesc (producer -> consumer)
+- seq (u64): monotonic publish sequence (for diagnostics/order checks)
+- offset (u64): payload offset in arena
+- length (u32): payload bytes
+- buffer_id (u32): unique id for recycle matching (can be seq lower 32)
+- pts_ns (i64)
+- dts_ns (i64)
+- duration_ns (i64)
+- flags (u32): keyframe/discont/marker/etc
+- checksum (u32 optional): optional debug consistency
+- reserved[...] to 64 bytes
+
+6.2 RecycleDesc (consumer -> producer)
+- seq (u64): monotonic recycle sequence
+- buffer_id (u32)
+- status (u32): OK, DROPPED, ERROR_CONSUME
+- offset (u64) (duplicate for robust matching)
+- length (u32)
+- reserved[...] to 64 bytes
+
+
+7. Concurrency Model
+--------------------
+
+MVP model
+- Exactly one sink process (single producer).
+- Exactly one src process (single consumer).
+- SPSC ring logic for both rings.
+
+Threads
+- Sink streaming thread:
+  - allocate arena block
+  - write payload
+  - publish ReadyDesc
+- Sink recycle thread or periodic polling in render path:
+  - consume RecycleDesc and free blocks
+- Src create thread:
+  - consume ReadyDesc
+  - produce GstBuffer wrappers
+- Src buffer finalize callback:
+  - publish RecycleDesc
+
+Locking
+- Protocol correctness does not require process-shared mutexes.
+- Atomic loads/stores with Acquire/Release ordering are primary mechanism.
+- Local Rust Mutex may protect sink-local allocator structures (not shared).
+
+
+8. Memory Ordering Rules (Critical)
+-----------------------------------
+
+Producer publish (ready ring)
+1) Write payload bytes to arena.
+2) Fill ReadyDesc fields in local order.
+3) Release-store ready_head = ready_head + 1.
+
+Consumer read (ready ring)
+1) Acquire-load ready_head.
+2) If tail == head: empty.
+3) Read descriptor at tail % capacity.
+4) Process payload.
+5) Release-store ready_tail = tail + 1.
+
+Consumer publish recycle
+1) Fill RecycleDesc.
+2) Release-store rec_head = rec_head + 1.
+
+Producer consume recycle
+1) Acquire-load rec_head.
+2) If rec_tail == rec_head: empty.
+3) Read recycle descriptor at rec_tail % capacity.
+4) Free allocator block.
+5) Release-store rec_tail = rec_tail + 1.
+
+Rationale
+- Release on producer side guarantees descriptor/payload visibility.
+- Acquire on consumer side guarantees coherent read.
+- Same for recycle direction.
+
+
+9. Allocator Strategy
+---------------------
+
+Requirement
+- Must replace shmalloc logic and support variable-sized buffer allocations.
+
+Recommended MVP allocator
+- Sink-local first-fit free list over arena offsets:
+  - free ranges sorted by offset
+  - allocate first fitting range with alignment
+  - on recycle, insert range and coalesce neighbors
+
+Why sink-local (not shared allocator metadata)?
+- Simpler correctness.
+- No shared allocator locking required.
+- Recycle protocol already returns exact buffer identity.
+
+Block identity
+- Track in sink map: buffer_id -> {offset, length, ref_state}
+- On recycle, validate and free.
+
+Fragmentation controls
+- alignment property (e.g., 64 bytes or page size for DMA-style use)
+- optional large-block reserve
+- metrics: allocation failures + high watermark
+
+Fallback behavior
+- If allocation fails:
+  - block until recycle arrives (default for backpressure parity), or
+  - drop newest/oldest based on policy property.
+
+
+10. GStreamer Element Behavior
+------------------------------
+
+10.1 shm2sink (BaseSink)
+Properties (current in shm2-rs)
+- shm-path (string)
+- shm-size (u64)
+- perms (mode)
+- wait-for-connection (bool)
+- consumer-timeout-ms (u32)
+
+Properties (planned/future)
+- buffer-time (ns, like shmsink semantics)
+- drop-when-no-consumer (bool)
+- notify-mode (enum: poll/futex/doorbell-hint)
+- allocator-align (u32)
+
+Core behavior
+- start():
+  - create/map file
+  - initialize header + rings + arena
+  - set state RUNNING
+  - spawn recycle handler loop (or integrate into render path)
+- propose_allocation():
+  - provide custom allocator that allocates from arena
+- render(buffer):
+  - ensure writable/contiguous memory in arena (copy only when required)
+  - write ReadyDesc
+  - update backpressure conditions
+- event(EOS):
+  - wait until all outstanding buffers recycled (configurable timeout)
+- stop():
+  - set STOPPING/STOPPED
+  - unmap/close
+
+10.2 shm2src (PushSrc)
+Properties
+- shm-path (string)
+- is-live (bool)
+- wait-timeout (ns or ms for polling cadence)
+
+Core behavior
+- start_reading():
+  - open/map existing region
+  - validate header
+- create():
+  - wait for ReadyDesc (poll loop)
+  - wrap arena memory in readonly GstBuffer
+  - attach finalize callback that pushes RecycleDesc
+- unlock/unlock_stop:
+  - break polling loop similarly to current shmsrc semantics
+- stop():
+  - update heartbeat, detach cleanly
+
+
+11. Buffer Lifetime Contract
+----------------------------
+
+Exactly-once recycle rule
+- Every ReadyDesc consumed into output GstBuffer must eventually produce one RecycleDesc.
+- Recycle may happen late (downstream queueing), so sink keeps allocation reserved until ack.
+
+Failure cases
+- Src crashes before recycle:
+  - sink detects stale consumer heartbeat
+  - sink enters recovery policy:
+    - safe mode: reclaim all outstanding after timeout and epoch bump
+    - strict mode: stop with error
+
+No in-place consumer mutation
+- Src exposes wrapped memory as READONLY GstMemory.
+- Any mutating downstream element causes copy, preserving transport safety.
+
+
+12. Connection Semantics Without Socket
+---------------------------------------
+
+Connection detection
+- Src sets consumer_heartbeat periodically.
+- Sink sets producer_heartbeat periodically.
+- "Connected" means heartbeat freshness within timeout.
+
+wait-for-connection behavior
+- If wait_for_connection=true, sink render blocks until consumer heartbeat becomes fresh.
+- If false, sink may drop or queue according to policy.
+
+
+13. Notification and Wake-Up Modes
+----------------------------------
+
+Mode 1: Poll-only (portable baseline)
+- Sink and src poll ring indices on interval or with adaptive spin/sleep.
+- Works across VMs with no kernel coupling.
+
+Mode 2: Futex-hint (single-host optimization)
+- Optional futex words in header.
+- If available, wait/wake reduces CPU.
+- Must degrade to poll when unsupported.
+
+Mode 3: ivshmem doorbell hint (future)
+- Protocol remains same.
+- Replace wait loop with platform interrupt trigger.
+
+
+14. Robustness and Recovery
+---------------------------
+
+Magic/version mismatch
+- Src fails fast with clear error.
+
+Epoch mismatch
+- If sink reinitializes, increments epoch.
+- Src detects epoch change and reattaches/restarts stream.
+
+Stale ring pointers
+- Validate head-tail distance <= capacity.
+- If invalid, set ERROR state and stop.
+
+Crash recovery
+- Sink startup can detect stale existing file:
+  - if state RUNNING but owner pid dead or heartbeat stale, reinitialize with new epoch.
+
+
+15. Security and Permissions
+----------------------------
+
+Permissions
+- Respect configurable perms (default similar to shmsink).
+
+Ownership checks
+- Optional uid/gid checks in header or from file stat.
+
+Data hygiene
+- Option to zero recycled regions for confidentiality-sensitive deployments.
+
+
+16. Serialization Choices
+-------------------------
+
+Rust struct layout
+- Use #[repr(C)] for header/descriptors.
+- Use bytemuck/zerocopy only on POD fields.
+- Avoid pointers in shared structs.
+
+Endian
+- Fix little-endian on wire (memory protocol).
+- Validate at attach; reject unsupported arch in MVP if needed.
+
+
+16.1 OS Backend Decoupling (Precise)
+------------------------------------
+
+Create a strict backend trait used by protocol + plugin layers.
+
+Trait sketch (conceptual)
+- `create(name, size, perms) -> Mapping`
+- `open(name) -> Mapping`
+- `mapping.as_ptr() / len()`
+- `flush(optional)`
+- `close()`
+- `unlink_or_cleanup(optional)`
+- `supports_wait_strategy(mode) -> bool`
+- `wait(strategy, addr, expected, timeout)` (optional)
+- `wake(strategy, addr, count)` (optional)
+
+Mapping abstraction
+- Returns raw region pointer + length only.
+- Hides fd/HANDLE.
+- Guarantees page-aligned mapping and valid lifetime.
+
+Backends
+- `backend_posix_shm` (Linux now):
+  - shm_open, ftruncate, mmap, munmap, shm_unlink
+- `backend_win_named_shm` (Windows later):
+  - CreateFileMapping/OpenFileMapping, MapViewOfFile, UnmapViewOfFile, CloseHandle
+- `backend_ivshmem` (future optional):
+  - map existing device region and optional doorbell hooks
+
+Backend selection
+- Compile-time feature flags plus runtime selection by URI-like name:
+  - `shm://gst-shm2-default` -> POSIX backend
+  - `winshm://Global/gst-shm2-default` -> Windows backend
+  - `ivshmem://region0` -> ivshmem backend
+- Protocol layer only sees bytes + atomics, not backend-specific handles.
+
+Minimal OS-dependent surface
+- name resolution/open/create
+- resize/create-time sizing
+- memory mapping lifetime
+- permission/security descriptors
+- optional wait/wake primitive
+
+Everything else remains platform-neutral:
+- header validation
+- ring math
+- descriptor encode/decode
+- allocator
+- crash recovery policy
+- sink/src state machines
+
+
+17. Testing Plan
+----------------
+
+Unit tests
+- Ring push/pop ordering.
+- Allocator allocate/free/coalesce.
+- Descriptor validation and bounds checks.
+
+Integration tests (single host)
+- fakesrc -> shm2sink -> shm2src -> appsink roundtrip.
+- zero-copy path via propose_allocation.
+- no-consumer mode behavior.
+- src late join/leave.
+- sink restart with epoch increment.
+
+Stress tests
+- random buffer sizes and burst patterns.
+- forced consumer delays to exercise backpressure.
+- crash simulation (kill -9 src or sink).
+
+Future ivshmem tests
+- same protocol with shared device region mapping.
+- verify poll-only mode before introducing doorbells.
+
+
+18. Suggested Rust Crate Structure
+----------------------------------
+
+Crates/modules
+- shm_platform/
+  - mod.rs (trait + common errors)
+  - posix_shm.rs
+  - windows_named_shm.rs (stub initially)
+  - ivshmem.rs (future)
+- shm_proto/
+  - header.rs
+  - ring.rs
+  - descriptor.rs
+  - atomics.rs
+- shm_allocator/
+  - freelist.rs
+  - block_map.rs
+- gst_plugin_shm2/
+  - shm2sink/imp.rs
+  - shm2src/imp.rs
+  - allocator.rs
+  - plugin.rs
+
+Key dependencies
+- gstreamer
+- gstreamer-base
+- glib
+- memmap2
+- nix (or libc wrappers)
+- bytemuck / zerocopy
+- windows-sys (future backend)
+
+
+19. Migration Mapping from Existing shmsink/shmsrc
+--------------------------------------------------
+
+Old socket commands -> new ring actions
+- NEW_BUFFER -> ReadyDesc publish
+- ACK_BUFFER -> RecycleDesc publish
+- NEW_SHM_AREA / CLOSE_SHM_AREA -> not needed in MVP fixed region
+
+Old shmalloc -> new allocator
+- same concept: offset-based blocks with delayed free after consumer ack.
+
+Old pollthread on socket
+- replaced by ring polling/notification logic.
+
+
+20. Implementation Progress Snapshot
+-----------------------------------
+
+Completed
+- Linux POSIX file backend (`/dev/shm/...`) and platform trait boundary.
+- Protocol structs, SPSC ready/recycle rings, producer allocator.
+- `shm2src` zero-copy output path with recycle on memory drop.
+- `shm2sink` custom allocator + `propose_allocation` fast path + copy fallback.
+- Heartbeat-based wait semantics (`wait-for-connection`, `consumer-timeout-ms`).
+- Single active consumer enforcement at protocol layer.
+
+Not completed yet
+- Optional futex optimization.
+- Robust crash-recovery epoch refinements beyond current heartbeat ownership model.
+- Windows named shared memory backend.
+- ivshmem-specific notifier integration.
+
+
+22. Platform-Decoupling Acceptance Criteria
+-------------------------------------------
+
+Required to accept implementation:
+- `shm_proto`, `shm_allocator`, and ring logic compile with no `cfg(target_os)` branches.
+- All OS calls are confined to `shm_platform/*`.
+- `gst_plugin_shm2` imports only trait types from `shm_platform`, never OS-native handles directly.
+- Linux and Windows backends can be selected without changing descriptor/header code.
+- End-to-end tests can run against a mock in-memory backend for protocol verification.
+
+
+23. GStreamer Plugin Wiring Plan (Concrete)
+-------------------------------------------
+
+Goal
+- Integrate the SHM transport core into real Rust GStreamer elements:
+  - `shm2sink` (writer)
+  - `shm2src` (reader)
+- Keep communication exclusively via one SHM region path.
+
+23.1 Module boundaries
+- `shm_platform/*`: OS APIs only (open/create/map/unmap/perms/wait hints)
+- `shm_proto/*`: shared structs + ring logic
+- `shm_allocator/*`: producer allocator
+- `gst_plugin_shm2/*`: element glue only
+
+Element code must never call mmap/open/Win32 APIs directly; it only uses `shm_platform` trait objects.
+
+23.2 shm2sink wiring (BaseSink)
+- Properties:
+  - `shm-path` (string)
+  - `shm-size` (u64)
+  - `perms` (u32)
+  - `wait-for-connection` (bool)
+  - `consumer-timeout-ms` (u32)
+- Lifecycle:
+  - `start()`: create writer transport and set running state
+  - `render()`: publish descriptors into SHM with two paths:
+    - fast path: publish pre-allocated SHM lease from sink allocator (no memcpy)
+    - fallback path: copy payload into SHM lease and publish
+  - `event(EOS)`: wait for pending recycle completion
+  - `stop()`: stop state and close mapping
+- Allocation:
+  - custom allocator is exposed via `propose_allocation`
+  - zero-copy depends on upstream using the proposed allocator
+
+23.3 shm2src wiring (PushSrc)
+- Properties:
+  - `shm-path` (string)
+  - `is-live` (bool)
+- Lifecycle:
+  - `start()`: open reader transport and claim single-consumer ownership
+  - `create()`: read next descriptor and output SHM-backed readonly GstBuffer memory
+  - `stop()`: close mapping
+  - `unlock()/unlock_stop()`: interrupt/restart blocking read loops
+- Recycling:
+  - recycle in GstMemory drop/finalize path
+  - ownership released on source stop
+
+23.4 Zero-copy integration (implemented)
+- Non-copy reader API is in place (`recv_desc_blocking` + descriptor metadata).
+- `shm2src` wraps mapped memory as readonly GstMemory.
+- Recycle happens in finalizer/drop callback to preserve lifetime.
+
+23.5 Safety invariants for plugin integration
+- Validate descriptor bounds (`offset+len <= arena_size`) before reading/wrapping.
+- Never expose writable SHM memory downstream.
+- Recycle exactly once per published buffer.
+- On protocol violation: element posts GST error and transitions to failure.
+
+23.6 Current behavior notes
+- Sink waits (blocks upstream via render backpressure) when `wait-for-connection=true` and no fresh consumer heartbeat is present.
+- If a consumer vanishes mid-stream, sink transitions to wait/retry loop (not process kill) while unlocked=false.
+- Protocol currently enforces a single active `shm2src`; second source fails during `start()` with explicit error.
+- Sink-side zero-copy is opportunistic; non-matching upstream memory uses fallback copy path.
+
+
+24. Zero-Copy Status and Remaining Work
+---------------------------------------
+
+Implemented objective
+- Source-side memcpy removal is complete (descriptor + SHM memory wrapping).
+- Sink-side upstream zero-copy allocator fast path is implemented.
+- SHM-only communication model remains unchanged.
+
+24.1 Implemented transport API
+- `Reader::recv_desc_blocking()` and non-blocking descriptor receive are implemented.
+- `Reader::payload_ptr()` bounds-checked pointer helper is implemented.
+- Copy compatibility API remains for tests/backward compatibility.
+- Writer-side lease APIs are implemented (`alloc_lease`, `publish_lease`, `free_lease`).
+
+24.2 Source zero-copy (`shm2src`)
+- Implemented: SHM-backed readonly memory wraps descriptor payload directly.
+- Implemented: recycle descriptor is enqueued from memory drop path.
+- Implemented: descriptor bounds validation before exposing payload.
+
+24.3 Reader ownership and thread-safety
+- Replace single mutable reader ownership with shareable state suitable for finalize callback:
+  - e.g. `Arc<Mutex<ReaderState>>` inside element instance
+- Finalizer must not panic and must avoid deadlock with streaming thread.
+- On recycle failure in finalizer:
+  - log warning and set counter; do not crash process.
+
+24.4 Sink upstream zero-copy (`shm2sink`)
+- Implemented: custom allocator exposed via `propose_allocation`.
+- Implemented: fast path publishes existing SHM lease when incoming memory matches allocator-owned pending lease.
+- Implemented: fallback copy path for foreign/transformed memory.
+- Implemented: unpublished leases are returned on memory drop to avoid leaks.
+
+24.5 Correctness invariants
+- Exactly-once recycle for each published `buffer_id`.
+- No recycle before downstream release of last buffer ref.
+- No writable mappings exposed on src side.
+- Every `offset/len` validated against `arena_size` before wrapping memory.
+
+24.6 Current test coverage and gaps
+- Present automated unit tests cover allocator coalescing and descriptor alignment.
+- Manual/integration runs cover end-to-end pipeline operation, single-consumer rejection, and attach/detach blocking behavior.
+- Added script-level integration test (`shm2-rs/scripts/nv12_attach_detach_test.sh`) for NV12 1920x1080@30 with repeated source attach/detach.
+- Gap: no automated assertion yet that sink fast path is selected vs fallback copy.
+- Gap: no long soak/fault-injection CI test matrix yet.
+
+24.7 Remaining rollout
+1. Add explicit instrumentation/counters for sink fast-path hit rate vs fallback copy.
+2. Add automated gst integration tests to CI (including attach/detach and disconnect races).
+3. Add long-duration soak + crash/restart fault-injection tests.
+4. Add Windows backend using current platform abstraction.
+
+
+21. Hard Constraints Checklist
+------------------------------
+
+Communication dependency checklist
+- [x] No Unix socket
+- [x] No pipe
+- [x] No external control channel required
+- [x] Control + data both in /dev/shm/xxx
+- [x] Poll-only mode exists for cross-VM compatibility
+
+This satisfies your requirement that src and sink communicate only through the shared memory file.
