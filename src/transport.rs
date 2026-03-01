@@ -890,12 +890,6 @@ fn align_up(v: usize, align: usize) -> usize {
     if rem == 0 { v } else { v + (align - rem) }
 }
 
-fn checksum32(data: &[u8]) -> u32 {
-    data.iter().fold(0u32, |acc, b| {
-        acc.wrapping_mul(16777619).wrapping_add(*b as u32)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

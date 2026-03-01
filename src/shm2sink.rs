@@ -60,7 +60,7 @@ struct PendingLease {
 }
 
 #[derive(Default)]
-struct AllocTracker {
+pub(crate) struct AllocTracker {
     writer: Option<Arc<Mutex<WriterType>>>,
     pending_by_ptr: HashMap<usize, PendingLease>,
 }
@@ -149,7 +149,7 @@ mod alloc_imp {
 
     #[derive(Default)]
     pub struct ShmArenaAllocator {
-        pub tracker: Mutex<Option<Arc<Mutex<AllocTracker>>>>,
+        pub(crate) tracker: Mutex<Option<Arc<Mutex<AllocTracker>>>>,
         pub align: Mutex<u64>,
     }
 
@@ -427,7 +427,7 @@ mod imp {
             let mut idle_no_space = 0u32;
 
             loop {
-                let mut state = self.state.lock().expect("state poisoned");
+                let state = self.state.lock().expect("state poisoned");
                 if state.unlocked {
                     return Err(gst::FlowError::Flushing);
                 }

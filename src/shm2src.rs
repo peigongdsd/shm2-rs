@@ -351,7 +351,6 @@ mod imp {
                     let state = self.state.lock().expect("state poisoned");
                     (state.settings.latest_only, reader.lock().map_err(|_| gst::FlowError::Error)?)
                 };
-                let now_rt = current_running_time_ns(&self.obj());
                 if latest_only {
                     match r
                         .try_recv_latest_desc()
