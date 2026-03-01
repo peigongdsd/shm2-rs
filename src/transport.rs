@@ -290,46 +290,15 @@ impl Writer {
             if let Some(alloc) = self.allocator.alloc(size, align) {
                 break alloc;
             }
-            eprintln!(
-                "[shm2] allocator full, dropping oldest ready buffer ready_used={}/{} rec_used={}/{}",
-                self.hdr
-                    .ready_head
-                    .load(Ordering::Acquire)
-                    .saturating_sub(self.hdr.ready_tail.load(Ordering::Acquire)),
-                self.hdr.ready_capacity,
-                self.hdr
-                    .rec_head
-                    .load(Ordering::Acquire)
-                    .saturating_sub(self.hdr.rec_tail.load(Ordering::Acquire)),
-                self.hdr.rec_capacity
-            );
             if self.drop_oldest_ready() {
                 continue;
             }
             // Nothing queued to drop: reset arena and retry once.
-            eprintln!("[shm2] allocator full with empty ready ring, resetting arena");
             self.reset_allocator_state();
             if let Some(alloc) = self.allocator.alloc(size, align) {
                 break alloc;
             }
             self.hdr.alloc_failures.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "[shm2] allocator exhausted: used_bytes={} arena_size={} size={} align={} ready_used={}/{} rec_used={}/{}",
-                self.allocator.used_bytes(),
-                self.hdr.arena_size,
-                size,
-                align,
-                self.hdr
-                    .ready_head
-                    .load(Ordering::Acquire)
-                    .saturating_sub(self.hdr.ready_tail.load(Ordering::Acquire)),
-                self.hdr.ready_capacity,
-                self.hdr
-                    .rec_head
-                    .load(Ordering::Acquire)
-                    .saturating_sub(self.hdr.rec_tail.load(Ordering::Acquire)),
-                self.hdr.rec_capacity
-            );
             return Err(ShmError::Exhausted);
         };
         let ptr = unsafe { self.arena.add(alloc.offset as usize) };
