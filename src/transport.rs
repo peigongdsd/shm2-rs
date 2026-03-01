@@ -276,24 +276,55 @@ impl Writer {
     }
 
     pub fn alloc_lease(&mut self, size: u32, align: u64) -> Result<AllocLease, ShmError> {
-        self.drain_recycles();
         let alloc = loop {
             if let Some(alloc) = self.allocator.alloc(size, align) {
                 break alloc;
             }
-            eprintln!("[shm2] allocator full, dropping oldest ready buffer");
-            // Drop the oldest queued buffer to make room.
-            if !self.drop_oldest_ready() {
-                self.hdr.alloc_failures.fetch_add(1, Ordering::Relaxed);
-                eprintln!(
-                    "[shm2] allocator exhausted: used_bytes={} arena_size={} size={} align={}",
-                    self.allocator.used_bytes(),
-                    self.hdr.arena_size,
-                    size,
-                    align
-                );
-                return Err(ShmError::Exhausted);
+            eprintln!(
+                "[shm2] allocator full, dropping oldest ready buffer ready_used={}/{} rec_used={}/{} consumer_owner={} consumer_hb_age_ns={}",
+                self.hdr
+                    .ready_head
+                    .load(Ordering::Acquire)
+                    .saturating_sub(self.hdr.ready_tail.load(Ordering::Acquire)),
+                self.hdr.ready_capacity,
+                self.hdr
+                    .rec_head
+                    .load(Ordering::Acquire)
+                    .saturating_sub(self.hdr.rec_tail.load(Ordering::Acquire)),
+                self.hdr.rec_capacity,
+                self.hdr.consumer_owner_pid.load(Ordering::Acquire),
+                now_nanos().saturating_sub(
+                    self.hdr.consumer_heartbeat_ns.load(Ordering::Acquire)
+                )
+            );
+            if self.drop_oldest_ready() {
+                continue;
             }
+            // Nothing queued to drop: reset arena and retry once.
+            eprintln!("[shm2] allocator full with empty ready ring, resetting arena");
+            self.reset_allocator_state();
+            if let Some(alloc) = self.allocator.alloc(size, align) {
+                break alloc;
+            }
+            self.hdr.alloc_failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[shm2] allocator exhausted: used_bytes={} arena_size={} size={} align={} ready_used={}/{} rec_used={}/{}",
+                self.allocator.used_bytes(),
+                self.hdr.arena_size,
+                size,
+                align,
+                self.hdr
+                    .ready_head
+                    .load(Ordering::Acquire)
+                    .saturating_sub(self.hdr.ready_tail.load(Ordering::Acquire)),
+                self.hdr.ready_capacity,
+                self.hdr
+                    .rec_head
+                    .load(Ordering::Acquire)
+                    .saturating_sub(self.hdr.rec_tail.load(Ordering::Acquire)),
+                self.hdr.rec_capacity
+            );
+            return Err(ShmError::Exhausted);
         };
         let ptr = unsafe { self.arena.add(alloc.offset as usize) };
         Ok(AllocLease {
@@ -341,7 +372,6 @@ impl Writer {
                 self.maybe_publish_timeline_snapshot(pts_ns, head + 1);
                 return Ok(());
             }
-            self.drain_recycles();
             poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
         }
     }
@@ -582,35 +612,39 @@ impl Reader {
             return Ok(None);
         }
 
-        let dropped = head.saturating_sub(tail + 1);
-        let newest_idx = ((head - 1) % cap) as usize;
-        let newest = self.ready[newest_idx];
+        let len = head.saturating_sub(tail);
+        let mut dropped = 0u64;
+        let mut chosen = tail;
+        // Vsync-friendly live policy:
+        // len==1 -> consume oldest
+        // len==2 -> consume oldest
+        // len>=3 -> drop oldest, consume next (2nd)
+        if len >= 3 {
+            let oldest_idx = (tail % cap) as usize;
+            let oldest = self.ready[oldest_idx];
+            if self.try_recycle_desc(oldest.buffer_id, oldest.offset, oldest.length, 1) {
+                dropped = 1;
+                chosen = tail + 1;
+            }
+        }
+
+        let chosen_idx = (chosen % cap) as usize;
+        let chosen_desc = self.ready[chosen_idx];
         let out = ReceivedDesc {
-            seq: newest.seq,
-            buffer_id: newest.buffer_id,
-            pts_ns: newest.pts_ns,
-            dts_ns: newest.dts_ns,
-            duration_ns: newest.duration_ns,
-            flags: newest.flags,
-            offset: newest.offset,
-            len: newest.length,
+            seq: chosen_desc.seq,
+            buffer_id: chosen_desc.buffer_id,
+            pts_ns: chosen_desc.pts_ns,
+            dts_ns: chosen_desc.dts_ns,
+            duration_ns: chosen_desc.duration_ns,
+            flags: chosen_desc.flags,
+            offset: chosen_desc.offset,
+            len: chosen_desc.length,
         };
 
         self.validate_bounds(out.offset, out.len as usize)?;
 
-        // Recycle older queued entries (tail..head-1).
-        let mut cur = tail;
-        while cur + 1 < head {
-            let idx = (cur % cap) as usize;
-            let desc = self.ready[idx];
-            if !self.try_recycle_desc(desc.buffer_id, desc.offset, desc.length, 1) {
-                break;
-            }
-            cur += 1;
-        }
-
-        // Consume all queued entries including the newest one we return.
-        self.hdr.ready_tail.store(head, Ordering::Release);
+        // Advance tail past the consumed entry (and any dropped oldest entry).
+        self.hdr.ready_tail.store(chosen + 1, Ordering::Release);
         self.touch_consumer_heartbeat();
         Ok(Some((out, dropped)))
     }

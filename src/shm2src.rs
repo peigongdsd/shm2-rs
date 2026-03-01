@@ -44,11 +44,14 @@ impl Default for Settings {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct TimelineState {
-    need_reset: bool,
-    in_base_pts_ns: Option<i64>,
-    out_base_running_ns: Option<u64>,
-    last_sync_seq: u64,
-    expected_sync_gen: u64,
+    expected_gen: u64,
+    offset_valid: bool,
+    offset_ns: i64,
+    last_snapshot_seq: u64,
+    sink_mono_at_snap: u64,
+    producer_pts_at_snap: i64,
+    need_discont: bool,
+    last_late_log_ns: u64,
 }
 
 #[derive(Default)]
@@ -104,41 +107,31 @@ fn current_running_time_ns(elem: &crate::shm2src::Shm2Src) -> Option<u64> {
     Some(now.saturating_sub(base))
 }
 
-fn rebase_pts_ns(desc_pts_ns: i64, in_base_pts_ns: i64, out_base_running_ns: u64) -> i64 {
-    if desc_pts_ns < 0 {
-        return -1;
-    }
-    let delta = (desc_pts_ns as i128) - (in_base_pts_ns as i128);
-    let clamped_delta = delta.max(0) as u64;
-    out_base_running_ns
-        .saturating_add(clamped_delta)
-        .min(i64::MAX as u64) as i64
-}
-
-fn apply_timeline_snapshot(ts: &mut TimelineState, snap: TimelineSnapshot, out_now_ns: u64) {
+fn update_clock_sync(ts: &mut TimelineState, snap: TimelineSnapshot, local_now_ns: u64) {
     if !snap.valid || snap.producer_pts_ns < 0 {
         return;
     }
-
-    let in_base = ts.in_base_pts_ns.unwrap_or(snap.producer_pts_ns.max(0));
-    let desired_out_base = out_now_ns.saturating_sub(snap.producer_pts_ns.max(0) as u64);
-
-    match ts.out_base_running_ns {
-        None => {
-            ts.in_base_pts_ns = Some(in_base);
-            ts.out_base_running_ns = Some(desired_out_base);
-        }
-        Some(cur_out_base) => {
-            // Slew-limit correction to avoid visible jumps (2ms per beacon step).
-            let err = (desired_out_base as i128) - (cur_out_base as i128);
-            let step = err.clamp(-2_000_000, 2_000_000);
-            let new_base = ((cur_out_base as i128) + step).max(0) as u64;
-            ts.in_base_pts_ns = Some(in_base);
-            ts.out_base_running_ns = Some(new_base);
-        }
+    if snap.seq == ts.last_snapshot_seq {
+        return;
     }
 
-    ts.last_sync_seq = snap.seq;
+    let desired_offset = (local_now_ns as i128) - (snap.sink_mono_ns as i128);
+    let desired_offset = desired_offset
+        .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+
+    if !ts.offset_valid {
+        ts.offset_ns = desired_offset;
+        ts.offset_valid = true;
+    } else {
+        // Slew-limit correction to avoid visible jumps (2ms per beacon step).
+        let err = desired_offset as i128 - ts.offset_ns as i128;
+        let step = err.clamp(-2_000_000, 2_000_000);
+        ts.offset_ns = (ts.offset_ns as i128 + step) as i64;
+    }
+
+    ts.last_snapshot_seq = snap.seq;
+    ts.sink_mono_at_snap = snap.sink_mono_ns;
+    ts.producer_pts_at_snap = snap.producer_pts_ns;
 }
 
 mod imp {
@@ -296,11 +289,14 @@ mod imp {
             self.obj().set_live(state.settings.is_live);
             state.reader = Some(Arc::new(Mutex::new(reader)));
             state.unlocked = false;
-            state.timeline.need_reset = true;
-            state.timeline.in_base_pts_ns = None;
-            state.timeline.out_base_running_ns = None;
-            state.timeline.last_sync_seq = 0;
-            state.timeline.expected_sync_gen = snap.generation;
+            state.timeline.expected_gen = snap.generation;
+            state.timeline.offset_valid = false;
+            state.timeline.offset_ns = 0;
+            state.timeline.last_snapshot_seq = 0;
+            state.timeline.sink_mono_at_snap = 0;
+            state.timeline.producer_pts_at_snap = 0;
+            state.timeline.need_discont = true;
+            state.timeline.last_late_log_ns = 0;
 
             if let Some(t) = state.hb_thread.take() {
                 let _ = t.join();
@@ -329,11 +325,14 @@ mod imp {
             }
             state.reader = None;
             state.unlocked = false;
-            state.timeline.need_reset = true;
-            state.timeline.in_base_pts_ns = None;
-            state.timeline.out_base_running_ns = None;
-            state.timeline.last_sync_seq = 0;
-            state.timeline.expected_sync_gen = 0;
+            state.timeline.expected_gen = 0;
+            state.timeline.offset_valid = false;
+            state.timeline.offset_ns = 0;
+            state.timeline.last_snapshot_seq = 0;
+            state.timeline.sink_mono_at_snap = 0;
+            state.timeline.producer_pts_at_snap = 0;
+            state.timeline.need_discont = true;
+            state.timeline.last_late_log_ns = 0;
             if let Some(stop) = state.hb_stop.take() {
                 stop.store(true, Ordering::Relaxed);
             }
@@ -378,7 +377,7 @@ mod imp {
             };
 
             let mut idle_cycles = 0u32;
-            let (desc, ptr, snap, dropped, _latest_only) = loop {
+            let (desc, ptr, snap, dropped) = loop {
                 {
                     let state = self.state.lock().expect("state poisoned");
                     if state.unlocked {
@@ -397,7 +396,7 @@ mod imp {
                         Some((desc, dropped)) => {
                             let ptr = r.payload_ptr(&desc).map_err(|_| gst::FlowError::Error)?;
                             let snap = r.timeline_snapshot();
-                            break (desc, ptr, snap, dropped, latest_only);
+                        break (desc, ptr, snap, dropped);
                         }
                         None => {
                             drop(r);
@@ -409,7 +408,7 @@ mod imp {
                         Some(desc) => {
                             let ptr = r.payload_ptr(&desc).map_err(|_| gst::FlowError::Error)?;
                             let snap = r.timeline_snapshot();
-                            break (desc, ptr, snap, 0, latest_only);
+                            break (desc, ptr, snap, 0);
                         }
                         None => {
                             drop(r);
@@ -435,54 +434,49 @@ mod imp {
                     (state.settings.live_only, TimelineState { ..state.timeline })
                 };
 
-                if snap.generation != ts.expected_sync_gen {
-                    ts.expected_sync_gen = snap.generation;
-                    ts.need_reset = true;
-                    ts.in_base_pts_ns = None;
-                    ts.out_base_running_ns = None;
-                    ts.last_sync_seq = 0;
+                if snap.generation != ts.expected_gen {
+                    ts.expected_gen = snap.generation;
+                    ts.offset_valid = false;
+                    ts.last_snapshot_seq = 0;
+                    ts.need_discont = true;
                 }
 
                 if live_only {
                     if let Some(now) = now_rt {
-                        if snap.valid
-                            && snap.snapshot_gen == ts.expected_sync_gen
-                            && snap.seq != ts.last_sync_seq
-                        {
-                            apply_timeline_snapshot(&mut ts, snap, now);
+                        update_clock_sync(&mut ts, snap, now);
+                    }
+
+                    let mut out_pts_ns: Option<u64> = None;
+                    if ts.offset_valid && desc.pts_ns >= 0 {
+                        let sink_time = desc.pts_ns
+                            + (ts.sink_mono_at_snap as i64 - ts.producer_pts_at_snap);
+                        let out = sink_time.saturating_add(ts.offset_ns);
+                        if out >= 0 {
+                            out_pts_ns = Some(out as u64);
                         }
                     }
 
-                    // Never fall back to raw producer PTS while reset is still unanchored.
-                    // Doing so can push frames into far-future timeline on reconnect and
-                    // make sync=true sinks appear frozen.
-                    let mut out_pts_ns = -1;
-                    if ts.need_reset {
-                        if let Some(now) = now_rt {
-                            ts.in_base_pts_ns = Some(desc.pts_ns.max(0));
-                            ts.out_base_running_ns = Some(now);
-                            ts.need_reset = false;
-                            buf.set_flags(gst::BufferFlags::DISCONT);
-                        }
-                    }
-                    if dropped > 0 {
-                        if let Some(now) = now_rt {
-                            ts.in_base_pts_ns = Some(desc.pts_ns.max(0));
-                            ts.out_base_running_ns = Some(now);
-                            buf.set_flags(gst::BufferFlags::DISCONT);
-                            out_pts_ns = now as i64;
-                        }
-                    }
-                    if let (Some(in_base), Some(out_base)) =
-                        (ts.in_base_pts_ns, ts.out_base_running_ns)
-                    {
-                        if out_pts_ns < 0 {
-                            out_pts_ns = rebase_pts_ns(desc.pts_ns, in_base, out_base);
-                        }
+                    if ts.need_discont || dropped > 0 {
+                        buf.set_flags(gst::BufferFlags::DISCONT);
+                        ts.need_discont = false;
                     }
 
-                    if out_pts_ns >= 0 {
-                        buf.set_pts(gst::ClockTime::from_nseconds(out_pts_ns as u64));
+                    if let Some(out_pts) = out_pts_ns {
+                        if let Some(now) = now_rt {
+                            if now > out_pts.saturating_add(50_000_000)
+                                && now.saturating_sub(ts.last_late_log_ns) > 1_000_000_000
+                            {
+                                eprintln!(
+                                    "[shm2] late pts: now_ns={} pts_ns={} lag_ns={} dropped={}",
+                                    now,
+                                    out_pts,
+                                    now.saturating_sub(out_pts),
+                                    dropped
+                                );
+                                ts.last_late_log_ns = now;
+                            }
+                        }
+                        buf.set_pts(gst::ClockTime::from_nseconds(out_pts));
                     }
 
                     let mut state = self.state.lock().expect("state poisoned");

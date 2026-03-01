@@ -52,9 +52,10 @@ struct State {
     writer: Option<Arc<Mutex<WriterType>>>,
     allocator: Option<ShmArenaAllocator>,
     unlocked: bool,
-    was_consumer_online: bool,
     hb_stop: Option<Arc<AtomicBool>>,
     hb_thread: Option<std::thread::JoinHandle<()>>,
+    gc_stop: Option<Arc<AtomicBool>>,
+    gc_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -85,19 +86,8 @@ impl AllocTracker {
             let mut w = writer
                 .lock()
                 .map_err(|_| glib::bool_error!("writer mutex poisoned"))?;
-            match w.alloc_lease(size as u32, align) {
-                Ok(lease) => lease,
-                Err(crate::platform::ShmError::Exhausted) => {
-                    // Arena may be full due to missing recycle. Reset and retry once.
-                    if w.is_consumer_online(1_000_000_000) {
-                        w.reset_allocator_state();
-                        self.pending_by_ptr.clear();
-                    }
-                    w.alloc_lease(size as u32, align)
-                        .map_err(|_| glib::bool_error!("shm allocation failed"))?
-                }
-                Err(_) => return Err(glib::bool_error!("shm allocation failed")),
-            }
+            w.alloc_lease(size as u32, align)
+                .map_err(|_| glib::bool_error!("shm allocation failed"))?
         };
         self.pending_by_ptr.insert(
             lease.ptr as usize,
@@ -136,9 +126,6 @@ impl AllocTracker {
         })
     }
 
-    fn reset_pending(&mut self) {
-        self.pending_by_ptr.clear();
-    }
 }
 
 struct ShmWritableMemory {
@@ -427,7 +414,6 @@ mod imp {
             state.writer = Some(writer);
             state.allocator = Some(allocator);
             state.unlocked = false;
-            state.was_consumer_online = false;
 
             if let Some(t) = state.hb_thread.take() {
                 let _ = t.join();
@@ -444,6 +430,21 @@ mod imp {
                     }
                 }));
             }
+            if let Some(t) = state.gc_thread.take() {
+                let _ = t.join();
+            }
+            if let Some(writer_arc) = state.writer.as_ref().cloned() {
+                let stop = Arc::new(AtomicBool::new(false));
+                state.gc_stop = Some(stop.clone());
+                state.gc_thread = Some(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(mut w) = writer_arc.lock() {
+                            w.drain_recycles();
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }));
+            }
             Ok(())
         }
 
@@ -455,6 +456,12 @@ mod imp {
             if let Some(t) = state.hb_thread.take() {
                 let _ = t.join();
             }
+            if let Some(stop) = state.gc_stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            if let Some(t) = state.gc_thread.take() {
+                let _ = t.join();
+            }
             if let Some(writer) = &state.writer {
                 if let Ok(w) = writer.lock() {
                     w.set_stopped();
@@ -463,7 +470,6 @@ mod imp {
             state.allocator = None;
             state.writer = None;
             state.unlocked = false;
-            state.was_consumer_online = false;
             Ok(())
         }
 
@@ -474,7 +480,7 @@ mod imp {
             let mut idle_no_space = 0u32;
 
             loop {
-                let mut state = self.state.lock().expect("state poisoned");
+                let state = self.state.lock().expect("state poisoned");
                 if state.unlocked {
                     return Err(gst::FlowError::Flushing);
                 }
@@ -488,25 +494,9 @@ mod imp {
                 let allocator = state.allocator.as_ref().cloned();
 
                 let online = {
-                    let mut w = writer.lock().map_err(|_| gst::FlowError::Error)?;
-                    let is_online = w.is_consumer_online(timeout_ns);
-                    if !is_online && state.was_consumer_online {
-                        // Consumer went away without recycling outstanding buffers.
-                        // Reclaim arena to avoid permanent allocator exhaustion.
-                        w.reset_allocator_state();
-                        if let Some(alloc) = allocator.as_ref() {
-                            if let Ok(mut tracker_guard) = alloc.imp().tracker.lock() {
-                                if let Some(tracker) = tracker_guard.as_mut() {
-                                    if let Ok(mut t) = tracker.lock() {
-                                        t.reset_pending();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    is_online
+                    let w = writer.lock().map_err(|_| gst::FlowError::Error)?;
+                    w.is_consumer_online(timeout_ns)
                 };
-                state.was_consumer_online = online;
 
                 if wait_for_connection && !online {
                     drop(state);
@@ -552,30 +542,6 @@ mod imp {
                                                 continue;
                                             }
                                             Err(crate::platform::ShmError::Exhausted) => {
-                                                let mut w = writer
-                                                    .lock()
-                                                    .map_err(|_| gst::FlowError::Error)?;
-                                                if w.is_consumer_online(timeout_ns) {
-                                                    eprintln!(
-                                                        "[shm2] allocator full with consumer online, resetting arena"
-                                                    );
-                                                    w.reset_allocator_state();
-                                                    if let Some(alloc) = allocator.as_ref() {
-                                                        if let Ok(mut tracker_guard) =
-                                                            alloc.imp().tracker.lock()
-                                                        {
-                                                            if let Some(tracker) =
-                                                                tracker_guard.as_mut()
-                                                            {
-                                                                if let Ok(mut t) =
-                                                                    tracker.lock()
-                                                                {
-                                                                    t.reset_pending();
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
                                                 drop(state);
                                                 poll_yield_sleep(
                                                     &mut idle_no_space,
@@ -600,21 +566,6 @@ mod imp {
                 match w.publish(map.as_slice(), pts_ns) {
                     Ok(_) => return Ok(gst::FlowSuccess::Ok),
                     Err(crate::platform::ShmError::Exhausted) => {
-                        if w.is_consumer_online(timeout_ns) {
-                            eprintln!(
-                                "[shm2] allocator full with consumer online, resetting arena"
-                            );
-                            w.reset_allocator_state();
-                            if let Some(alloc) = allocator.as_ref() {
-                                if let Ok(mut tracker_guard) = alloc.imp().tracker.lock() {
-                                    if let Some(tracker) = tracker_guard.as_mut() {
-                                        if let Ok(mut t) = tracker.lock() {
-                                            t.reset_pending();
-                                        }
-                                    }
-                                }
-                            }
-                        }
                         drop(state);
                         poll_yield_sleep(&mut idle_no_space, Duration::from_millis(1));
                     }
