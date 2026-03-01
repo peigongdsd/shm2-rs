@@ -26,6 +26,7 @@ const DEFAULT_PATH: &str = "winshm://Local/gst-shm2-default";
 struct Settings {
     shm_path: String,
     is_live: bool,
+    live_only: bool,
 }
 
 impl Default for Settings {
@@ -33,8 +34,16 @@ impl Default for Settings {
         Self {
             shm_path: DEFAULT_PATH.to_string(),
             is_live: false,
+            live_only: true,
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct TimelineState {
+    need_reset: bool,
+    in_base_pts_ns: Option<i64>,
+    out_base_running_ns: Option<u64>,
 }
 
 #[derive(Default)]
@@ -42,6 +51,7 @@ struct State {
     settings: Settings,
     reader: Option<Arc<Mutex<ReaderType>>>,
     unlocked: bool,
+    timeline: TimelineState,
 }
 
 struct ShmReadWrap {
@@ -80,6 +90,24 @@ fn poll_yield_sleep(idle_cycles: &mut u32, steady_sleep: Duration) {
     *idle_cycles = idle_cycles.saturating_add(1);
 }
 
+fn current_running_time_ns(elem: &crate::shm2src::Shm2Src) -> Option<u64> {
+    let clock = elem.clock()?;
+    let now = clock.time()?.nseconds();
+    let base = elem.base_time()?.nseconds();
+    Some(now.saturating_sub(base))
+}
+
+fn rebase_pts_ns(desc_pts_ns: i64, in_base_pts_ns: i64, out_base_running_ns: u64) -> i64 {
+    if desc_pts_ns < 0 {
+        return -1;
+    }
+    let delta = (desc_pts_ns as i128) - (in_base_pts_ns as i128);
+    let clamped_delta = delta.max(0) as u64;
+    out_base_running_ns
+        .saturating_add(clamped_delta)
+        .min(i64::MAX as u64) as i64
+}
+
 mod imp {
     use super::*;
 
@@ -111,6 +139,12 @@ mod imp {
                         .default_value(false)
                         .mutable_ready()
                         .build(),
+                    glib::ParamSpecBoolean::builder("live-only")
+                        .nick("Live only")
+                        .blurb("On attach/re-attach, restart output timeline from current running time")
+                        .default_value(true)
+                        .mutable_ready()
+                        .build(),
                 ]
             });
             PROPERTIES.as_ref()
@@ -130,6 +164,11 @@ mod imp {
                         self.obj().set_live(v);
                     }
                 }
+                "live-only" => {
+                    if let Ok(v) = value.get::<bool>() {
+                        state.settings.live_only = v;
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -139,6 +178,7 @@ mod imp {
             match pspec.name() {
                 "shm-path" => state.settings.shm_path.to_value(),
                 "is-live" => state.settings.is_live.to_value(),
+                "live-only" => state.settings.live_only.to_value(),
                 _ => unreachable!(),
             }
         }
@@ -211,6 +251,9 @@ mod imp {
             self.obj().set_live(state.settings.is_live);
             state.reader = Some(Arc::new(Mutex::new(reader)));
             state.unlocked = false;
+            state.timeline.need_reset = true;
+            state.timeline.in_base_pts_ns = None;
+            state.timeline.out_base_running_ns = None;
             Ok(())
         }
 
@@ -223,6 +266,9 @@ mod imp {
             }
             state.reader = None;
             state.unlocked = false;
+            state.timeline.need_reset = true;
+            state.timeline.in_base_pts_ns = None;
+            state.timeline.out_base_running_ns = None;
             Ok(())
         }
 
@@ -290,8 +336,38 @@ mod imp {
             let mem = gst::Memory::from_slice(wrap);
             let mut out = gst::Buffer::new();
             if let Some(buf) = out.get_mut() {
-                if desc.pts_ns >= 0 {
-                    buf.set_pts(gst::ClockTime::from_nseconds(desc.pts_ns as u64));
+                let (live_only, mut need_reset, mut in_base_pts_ns, mut out_base_running_ns) = {
+                    let state = self.state.lock().expect("state poisoned");
+                    (
+                        state.settings.live_only,
+                        state.timeline.need_reset,
+                        state.timeline.in_base_pts_ns,
+                        state.timeline.out_base_running_ns,
+                    )
+                };
+
+                let mut out_pts_ns = desc.pts_ns;
+                if live_only {
+                    if need_reset {
+                        in_base_pts_ns = Some(desc.pts_ns.max(0));
+                        out_base_running_ns = current_running_time_ns(&self.obj())
+                            .or_else(|| desc.pts_ns.try_into().ok())
+                            .or(Some(0));
+                        need_reset = false;
+                        buf.set_flags(gst::BufferFlags::DISCONT);
+                    }
+                    if let (Some(in_base), Some(out_base)) = (in_base_pts_ns, out_base_running_ns) {
+                        out_pts_ns = rebase_pts_ns(desc.pts_ns, in_base, out_base);
+                    }
+
+                    let mut state = self.state.lock().expect("state poisoned");
+                    state.timeline.need_reset = need_reset;
+                    state.timeline.in_base_pts_ns = in_base_pts_ns;
+                    state.timeline.out_base_running_ns = out_base_running_ns;
+                }
+
+                if out_pts_ns >= 0 {
+                    buf.set_pts(gst::ClockTime::from_nseconds(out_pts_ns as u64));
                 }
                 buf.append_memory(mem);
             }
