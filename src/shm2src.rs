@@ -349,12 +349,15 @@ mod imp {
                 let mut out_pts_ns = desc.pts_ns;
                 if live_only {
                     if need_reset {
-                        in_base_pts_ns = Some(desc.pts_ns.max(0));
-                        out_base_running_ns = current_running_time_ns(&self.obj())
-                            .or_else(|| desc.pts_ns.try_into().ok())
-                            .or(Some(0));
-                        need_reset = false;
-                        buf.set_flags(gst::BufferFlags::DISCONT);
+                        // Only arm the re-timestamp anchor once src has a valid running-time
+                        // clock. Falling back to producer PTS here can place frames far in the
+                        // future and cause long visible freezes with sync=true sinks.
+                        if let Some(rt_now) = current_running_time_ns(&self.obj()) {
+                            in_base_pts_ns = Some(desc.pts_ns.max(0));
+                            out_base_running_ns = Some(rt_now);
+                            need_reset = false;
+                            buf.set_flags(gst::BufferFlags::DISCONT);
+                        }
                     }
                     if let (Some(in_base), Some(out_base)) = (in_base_pts_ns, out_base_running_ns) {
                         out_pts_ns = rebase_pts_ns(desc.pts_ns, in_base, out_base);
