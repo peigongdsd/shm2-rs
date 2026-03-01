@@ -461,15 +461,6 @@ mod imp {
                     while !stop.load(Ordering::Relaxed) {
                         if let Ok(w) = writer_arc.lock() {
                             w.producer_heartbeat_tick();
-                            let startup = w.startup_snapshot();
-                            if startup.state != STARTUP_RUNNING {
-                                if startup.state == STARTUP_SRC_READY {
-                                    let _ =
-                                        w.set_startup_state(startup.generation, STARTUP_RUNNING);
-                                } else {
-                                    let _ = w.bump_startup_seq(startup.generation);
-                                }
-                            }
                         }
                         std::thread::sleep(Duration::from_millis(20));
                     }
@@ -556,9 +547,22 @@ mod imp {
                 }
 
                 {
-                    let w = writer.lock().map_err(|_| gst::FlowError::Error)?;
+                    let mut w = writer.lock().map_err(|_| gst::FlowError::Error)?;
                     let startup = w.startup_snapshot();
                     if startup.state != STARTUP_RUNNING {
+                        if startup.state == STARTUP_SRC_READY {
+                            eprintln!(
+                                "[shm2] startup: src ready (gen {}), switching to RUNNING",
+                                startup.generation
+                            );
+                            let _ = w.set_startup_state(startup.generation, STARTUP_RUNNING);
+                        } else {
+                            eprintln!(
+                                "[shm2] startup: waiting (gen {} state {})",
+                                startup.generation, startup.state
+                            );
+                        }
+                        w.emit_timeline_snapshot(pts_ns);
                         return Ok(gst::FlowSuccess::Ok);
                     }
                 }
