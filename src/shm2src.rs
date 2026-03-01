@@ -274,6 +274,7 @@ mod imp {
                     ]
                 )
             })?;
+            self.obj().set_format(gst::Format::Time);
             let snap = reader.timeline_snapshot();
             self.obj().set_live(state.settings.is_live);
             state.reader = Some(Arc::new(Mutex::new(reader)));
