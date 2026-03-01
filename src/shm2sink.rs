@@ -381,10 +381,11 @@ mod imp {
     impl Shm2Sink {
         fn reset_upstream_timing(&self) {
             let Some(pad) = self.obj().static_pad("sink") else {
+                eprintln!("[shm2] timing reset: missing sink pad");
                 return;
             };
-            let _ = pad.send_event(gst::event::FlushStart::new());
-            let _ = pad.send_event(gst::event::FlushStop::new(false));
+            let flush_start_ok = pad.send_event(gst::event::FlushStart::new());
+            let flush_stop_ok = pad.send_event(gst::event::FlushStop::new(false));
             let now = self
                 .obj()
                 .clock()
@@ -405,7 +406,11 @@ mod imp {
                 gst::SeekType::None,
                 gst::ClockTime::NONE,
             );
-            let _ = pad.send_event(seek);
+            let seek_ok = pad.send_event(seek);
+            eprintln!(
+                "[shm2] timing reset: flush_start={} flush_stop={} seek={} now_ns={} base_ns={} running_ns={}",
+                flush_start_ok, flush_stop_ok, seek_ok, now, base, running
+            );
         }
     }
 
@@ -534,6 +539,12 @@ mod imp {
                     let w = writer.lock().map_err(|_| gst::FlowError::Error)?;
                     w.is_consumer_online(timeout_ns)
                 };
+                if online != state.was_consumer_online {
+                    eprintln!(
+                        "[shm2] consumer_online {} -> {} (timeout_ns={})",
+                        state.was_consumer_online, online, timeout_ns
+                    );
+                }
                 if online && !state.was_consumer_online {
                     eprintln!("[shm2] consumer online, resetting upstream timing");
                     self.reset_upstream_timing();
