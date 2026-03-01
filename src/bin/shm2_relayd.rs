@@ -47,9 +47,10 @@ fn parse_listen(spec: &str) -> Result<ListenSpec, String> {
     Err("listen must be tcp://host:port or vsock://cid:port".to_string())
 }
 
-fn parse_args() -> Result<(ListenSpec, String, String, Option<String>), String> {
+fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>), String> {
     let mut listen = "tcp://0.0.0.0:5555".to_string();
     let mut shm_path: Option<String> = None;
+    let mut shm_size: u64 = 64 * 1024 * 1024;
     let mut input: Option<String> = None;
     let mut splash: Option<String> = None;
 
@@ -63,6 +64,12 @@ fn parse_args() -> Result<(ListenSpec, String, String, Option<String>), String> 
             }
             "--shm-path" => {
                 shm_path = Some(args.next().ok_or("--shm-path requires a value")?);
+            }
+            "--shm-size" => {
+                let value = args.next().ok_or("--shm-size requires a value")?;
+                shm_size = value
+                    .parse::<u64>()
+                    .map_err(|_| "--shm-size must be a u64")?;
             }
             "--input" => {
                 input = Some(args.next().ok_or("--input requires a pipeline string")?);
@@ -81,12 +88,12 @@ fn parse_args() -> Result<(ListenSpec, String, String, Option<String>), String> 
     let input = input.ok_or("--input is required")?;
     let listen = parse_listen(&listen)?;
 
-    Ok((listen, shm_path, input, splash))
+    Ok((listen, shm_path, shm_size, input, splash))
 }
 
 fn usage() {
     eprintln!(
-        "Usage: shm2_relayd --shm-path <path> --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT]"
+        "Usage: shm2_relayd --shm-path <path> [--shm-size <bytes>] --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT]"
     );
 }
 
@@ -101,10 +108,13 @@ fn set_pipeline_time(pipeline: &gst::Pipeline, base_time: Option<gst::ClockTime>
     pipeline.set_start_time(gst::ClockTime::NONE);
 }
 
-fn output_pipeline_create(shm_path: &str) -> Result<(gst::Pipeline, gst_app::AppSrc), gst::glib::Error> {
+fn output_pipeline_create(
+    shm_path: &str,
+    shm_size: u64,
+) -> Result<(gst::Pipeline, gst_app::AppSrc), gst::glib::Error> {
     let pipeline_str = format!(
-        "appsrc name=appsrc is-live=true format=time stream-type=stream ! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 leaky=downstream ! shm2sink shm-path={}",
-        shm_path
+        "appsrc name=appsrc is-live=true format=time stream-type=stream ! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 leaky=downstream ! shm2sink shm-path={} shm-size={}",
+        shm_path, shm_size
     );
     let element = gst::parse::launch(&pipeline_str)?;
     let pipeline = element
@@ -355,7 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(Box::new(err));
     }
 
-    let (listen, shm_path, input, splash) = match parse_args() {
+    let (listen, shm_path, shm_size, input, splash) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             if e == "help" {
@@ -368,7 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let (output_pipeline, appsrc) = output_pipeline_create(&shm_path)?;
+    let (output_pipeline, appsrc) = output_pipeline_create(&shm_path, shm_size)?;
     let base_time = output_pipeline.base_time();
 
     let input_pipeline = backend_pipeline_create("input-pipeline", &input, &appsrc, base_time)?;

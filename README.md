@@ -101,6 +101,7 @@ Usage:
 cargo run --bin shm2_relayd -- \
   --listen tcp://0.0.0.0:5555 \
   --shm-path shm:///dev/shm/gst-shm2-pipe \
+  --shm-size 67108864 \
   --input "videotestsrc is-live=true pattern=ball ! videoconvert"
 ```
 
@@ -110,6 +111,7 @@ Optional splash (runs only when no clients):
 cargo run --bin shm2_relayd -- \
   --listen tcp://0.0.0.0:5555 \
   --shm-path shm:///dev/shm/gst-shm2-pipe \
+  --shm-size 67108864 \
   --input "v4l2src ! videoconvert" \
   --splash "videotestsrc is-live=true pattern=black ! videoconvert"
 ```
