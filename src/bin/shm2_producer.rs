@@ -40,6 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     writer.drain_recycles();
                     thread::sleep(Duration::from_millis(1));
                 }
+                Err(ShmError::NoConsumer) => {
+                    writer.drain_recycles();
+                    thread::sleep(Duration::from_millis(5));
+                }
                 Err(err) => return Err(err.into()),
             }
         }

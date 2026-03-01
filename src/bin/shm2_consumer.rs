@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    reader.claim_consumer(std::process::id())?;
 
     println!("consumer: attached to {path}");
 
@@ -42,5 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("consumer: done");
+    reader.release_consumer(std::process::id());
     Ok(())
 }

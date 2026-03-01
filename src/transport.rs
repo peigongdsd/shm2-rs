@@ -166,6 +166,14 @@ pub struct ReceivedDesc {
     pub len: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AllocLease {
+    pub buffer_id: u32,
+    pub offset: u64,
+    pub len: u32,
+    pub ptr: *mut u8,
+}
+
 impl<B: ShmBackend> Writer<B> {
     pub fn create(backend: &B, path: &str, cfg: TransportConfig) -> Result<Self, ShmError> {
         if cfg.ready_capacity == 0 || cfg.recycle_capacity == 0 {
@@ -211,66 +219,67 @@ impl<B: ShmBackend> Writer<B> {
     }
 
     pub fn publish(&mut self, payload: &[u8], pts_ns: i64) -> Result<u32, ShmError> {
+        let lease = self.alloc_lease(payload.len() as u32, self.allocator_align)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), lease.ptr, payload.len());
+        }
+        if let Err(err) = self.publish_lease(lease, pts_ns) {
+            let _ = self.free_lease(lease.buffer_id);
+            return Err(err);
+        }
+        Ok(lease.buffer_id)
+    }
+
+    pub fn alloc_lease(&mut self, size: u32, align: u64) -> Result<AllocLease, ShmError> {
+        self.drain_recycles();
+        let alloc = self.allocator.alloc(size, align).ok_or_else(|| {
+            self.hdr.alloc_failures.fetch_add(1, Ordering::Relaxed);
+            ShmError::Exhausted
+        })?;
+        let ptr = unsafe { self.arena.add(alloc.offset as usize) };
+        Ok(AllocLease {
+            buffer_id: alloc.buffer_id,
+            offset: alloc.offset,
+            len: alloc.len,
+            ptr,
+        })
+    }
+
+    pub fn free_lease(&mut self, buffer_id: u32) -> bool {
+        let freed = self.allocator.free_by_id(buffer_id);
+        self.hdr
+            .arena_used_bytes
+            .store(self.allocator.used_bytes(), Ordering::Relaxed);
+        freed
+    }
+
+    pub fn publish_lease(&mut self, lease: AllocLease, pts_ns: i64) -> Result<(), ShmError> {
         if !self.is_consumer_online(1_000_000_000) {
             return Err(ShmError::NoConsumer);
         }
-        self.drain_recycles();
-
-        let alloc = self
-            .allocator
-            .alloc(payload.len() as u32, self.allocator_align)
-            .ok_or_else(|| {
-                self.hdr.alloc_failures.fetch_add(1, Ordering::Relaxed);
-                ShmError::Exhausted
-            })?;
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                payload.as_ptr(),
-                self.arena.add(alloc.offset as usize),
-                payload.len(),
-            );
-        }
-
         loop {
             let head = self.hdr.ready_head.load(Ordering::Relaxed);
             let tail = self.hdr.ready_tail.load(Ordering::Acquire);
             let cap = u64::from(self.hdr.ready_capacity);
             if head.wrapping_sub(tail) < cap {
                 let idx = (head % cap) as usize;
-                let desc = ReadyDesc {
+                self.ready[idx] = ReadyDesc {
                     seq: head + 1,
-                    offset: alloc.offset,
-                    length: alloc.len,
-                    buffer_id: alloc.buffer_id,
+                    offset: lease.offset,
+                    length: lease.len,
+                    buffer_id: lease.buffer_id,
                     pts_ns,
                     dts_ns: pts_ns,
                     duration_ns: 0,
                     flags: 0,
-                    checksum: checksum32(payload),
+                    checksum: 0,
                     reserved: [0u8; 8],
                 };
-                self.ready[idx] = desc;
                 self.hdr.ready_head.store(head + 1, Ordering::Release);
-
-                let used = self.allocator.used_bytes();
-                self.hdr.arena_used_bytes.store(used, Ordering::Relaxed);
-                let mut prev_hw = self.hdr.arena_high_watermark.load(Ordering::Relaxed);
-                while used > prev_hw {
-                    match self.hdr.arena_high_watermark.compare_exchange_weak(
-                        prev_hw,
-                        used,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(v) => prev_hw = v,
-                    }
-                }
                 self.touch_producer_heartbeat();
-                return Ok(alloc.buffer_id);
+                self.update_usage_metrics();
+                return Ok(());
             }
-
             self.drain_recycles();
             thread::sleep(Duration::from_millis(1));
         }
@@ -324,6 +333,23 @@ impl<B: ShmBackend> Writer<B> {
         self.hdr
             .producer_heartbeat_ns
             .store(now_nanos(), Ordering::Relaxed);
+    }
+
+    fn update_usage_metrics(&self) {
+        let used = self.allocator.used_bytes();
+        self.hdr.arena_used_bytes.store(used, Ordering::Relaxed);
+        let mut prev_hw = self.hdr.arena_high_watermark.load(Ordering::Relaxed);
+        while used > prev_hw {
+            match self.hdr.arena_high_watermark.compare_exchange_weak(
+                prev_hw,
+                used,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => prev_hw = v,
+            }
+        }
     }
 }
 

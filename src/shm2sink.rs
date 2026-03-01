@@ -1,4 +1,8 @@
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::slice;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use gst::glib;
 use gst::prelude::*;
@@ -9,7 +13,7 @@ use gstreamer_base as gst_base;
 use once_cell::sync::Lazy;
 
 use crate::platform::posix_file::PosixFileBackend;
-use crate::transport::{TransportConfig, Writer};
+use crate::transport::{AllocLease, TransportConfig, Writer};
 
 type WriterType = Writer<PosixFileBackend>;
 
@@ -39,8 +43,164 @@ impl Default for Settings {
 #[derive(Default)]
 struct State {
     settings: Settings,
-    writer: Option<WriterType>,
+    writer: Option<Arc<Mutex<WriterType>>>,
+    allocator: Option<ShmArenaAllocator>,
     unlocked: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingLease {
+    buffer_id: u32,
+    offset: u64,
+    len: u32,
+}
+
+#[derive(Default)]
+struct AllocTracker {
+    writer: Option<Arc<Mutex<WriterType>>>,
+    pending_by_ptr: HashMap<usize, PendingLease>,
+}
+
+impl AllocTracker {
+    fn alloc_lease_for_upstream(
+        &mut self,
+        size: usize,
+        align: u64,
+    ) -> Result<AllocLease, glib::BoolError> {
+        let writer = self
+            .writer
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| glib::bool_error!("shm writer not available"))?;
+        let lease = {
+            let mut w = writer
+                .lock()
+                .map_err(|_| glib::bool_error!("writer mutex poisoned"))?;
+            w.alloc_lease(size as u32, align)
+                .map_err(|_| glib::bool_error!("shm allocation failed"))?
+        };
+        self.pending_by_ptr.insert(
+            lease.ptr as usize,
+            PendingLease {
+                buffer_id: lease.buffer_id,
+                offset: lease.offset,
+                len: lease.len,
+            },
+        );
+        Ok(lease)
+    }
+
+    fn release_unpublished(&mut self, ptr: *mut u8) {
+        if let Some(pending) = self.pending_by_ptr.remove(&(ptr as usize)) {
+            if let Some(writer) = &self.writer {
+                if let Ok(mut w) = writer.lock() {
+                    let _ = w.free_lease(pending.buffer_id);
+                }
+            }
+        }
+    }
+
+    fn mark_published(&mut self, ptr: *const u8, len: usize) -> Option<AllocLease> {
+        let key = ptr as usize;
+        let pending = self.pending_by_ptr.remove(&key)?;
+        if pending.len as usize != len {
+            // length mismatch means this is not a direct whole-block fast path
+            self.pending_by_ptr.insert(key, pending);
+            return None;
+        }
+        Some(AllocLease {
+            buffer_id: pending.buffer_id,
+            offset: pending.offset,
+            len: pending.len,
+            ptr: key as *mut u8,
+        })
+    }
+}
+
+struct ShmWritableMemory {
+    tracker: Arc<Mutex<AllocTracker>>,
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AsMut<[u8]> for ShmWritableMemory {
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+unsafe impl Send for ShmWritableMemory {}
+
+impl Drop for ShmWritableMemory {
+    fn drop(&mut self) {
+        if let Ok(mut t) = self.tracker.lock() {
+            t.release_unpublished(self.ptr);
+        }
+    }
+}
+
+mod alloc_imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct ShmArenaAllocator {
+        pub tracker: Mutex<Option<Arc<Mutex<AllocTracker>>>>,
+        pub align: Mutex<u64>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for ShmArenaAllocator {
+        const NAME: &'static str = "GstShm2ArenaAllocator";
+        type Type = super::ShmArenaAllocator;
+        type ParentType = gst::Allocator;
+    }
+
+    impl ObjectImpl for ShmArenaAllocator {}
+    impl GstObjectImpl for ShmArenaAllocator {}
+
+    impl AllocatorImpl for ShmArenaAllocator {
+        fn alloc(
+            &self,
+            size: usize,
+            _params: Option<&gst::AllocationParams>,
+        ) -> Result<gst::Memory, glib::BoolError> {
+            let tracker = self
+                .tracker
+                .lock()
+                .map_err(|_| glib::bool_error!("tracker mutex poisoned"))?
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| glib::bool_error!("tracker unavailable"))?;
+            let align = *self
+                .align
+                .lock()
+                .map_err(|_| glib::bool_error!("align mutex poisoned"))?;
+            let lease = tracker
+                .lock()
+                .map_err(|_| glib::bool_error!("tracker mutex poisoned"))?
+                .alloc_lease_for_upstream(size, align)?;
+            let wrapped = ShmWritableMemory {
+                tracker: tracker.clone(),
+                ptr: lease.ptr,
+                len: lease.len as usize,
+            };
+            Ok(gst::Memory::from_mut_slice(wrapped))
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct ShmArenaAllocator(ObjectSubclass<alloc_imp::ShmArenaAllocator>) @extends gst::Allocator, gst::Object;
+}
+
+impl ShmArenaAllocator {
+    fn with_tracker(tracker: Arc<Mutex<AllocTracker>>, align: u64) -> Self {
+        let obj: ShmArenaAllocator = glib::Object::new();
+        let imp = obj.imp();
+        *imp.tracker.lock().expect("tracker mutex poisoned") = Some(tracker);
+        *imp.align.lock().expect("align mutex poisoned") = align.max(1);
+        obj
+    }
 }
 
 mod imp {
@@ -201,7 +361,14 @@ mod imp {
                 })?;
 
             writer.set_running();
+            let writer = Arc::new(Mutex::new(writer));
+            let tracker = Arc::new(Mutex::new(AllocTracker {
+                writer: Some(writer.clone()),
+                pending_by_ptr: HashMap::new(),
+            }));
+            let allocator = ShmArenaAllocator::with_tracker(tracker, 64);
             state.writer = Some(writer);
+            state.allocator = Some(allocator);
             state.unlocked = false;
             Ok(())
         }
@@ -209,8 +376,11 @@ mod imp {
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
             if let Some(writer) = &state.writer {
-                writer.set_stopped();
+                if let Ok(w) = writer.lock() {
+                    w.set_stopped();
+                }
             }
+            state.allocator = None;
             state.writer = None;
             state.unlocked = false;
             Ok(())
@@ -227,23 +397,86 @@ mod imp {
                 }
                 let wait_for_connection = state.settings.wait_for_connection;
                 let timeout_ns = (state.settings.consumer_timeout_ms as u64) * 1_000_000;
-                let writer = state.writer.as_mut().ok_or(gst::FlowError::Flushing)?;
+                let writer = state
+                    .writer
+                    .as_ref()
+                    .cloned()
+                    .ok_or(gst::FlowError::Flushing)?;
+                let allocator = state.allocator.as_ref().cloned();
 
-                if wait_for_connection && !writer.is_consumer_online(timeout_ns) {
+                if wait_for_connection
+                    && !writer
+                        .lock()
+                        .map_err(|_| gst::FlowError::Error)?
+                        .is_consumer_online(timeout_ns)
+                {
                     drop(state);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(5));
                     continue;
                 }
 
-                match writer.publish(map.as_slice(), pts_ns) {
+                // Sink fast path: upstream memory came from our SHM allocator.
+                let mut fast_published = false;
+                if let Some(alloc) = allocator.as_ref() {
+                    if buffer.n_memory() == 1 {
+                        let mem0 = buffer.peek_memory(0);
+                        if let Some(mem_alloc) = mem0.allocator() {
+                            if mem_alloc == alloc.upcast_ref::<gst::Allocator>() {
+                                if let Some(tracker) = alloc
+                                    .imp()
+                                    .tracker
+                                    .lock()
+                                    .expect("tracker mutex poisoned")
+                                    .as_ref()
+                                    .cloned()
+                                {
+                                    if let Some(lease) = tracker
+                                        .lock()
+                                        .expect("tracker mutex poisoned")
+                                        .mark_published(
+                                            map.as_slice().as_ptr(),
+                                            map.as_slice().len(),
+                                        )
+                                    {
+                                        let mut w =
+                                            writer.lock().map_err(|_| gst::FlowError::Error)?;
+                                        match w.publish_lease(lease, pts_ns) {
+                                            Ok(_) => fast_published = true,
+                                            Err(crate::platform::ShmError::NoConsumer)
+                                                if wait_for_connection =>
+                                            {
+                                                drop(state);
+                                                thread::sleep(Duration::from_millis(5));
+                                                continue;
+                                            }
+                                            Err(crate::platform::ShmError::Exhausted) => {
+                                                drop(state);
+                                                thread::sleep(Duration::from_millis(1));
+                                                continue;
+                                            }
+                                            Err(_) => return Err(gst::FlowError::Error),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if fast_published {
+                    return Ok(gst::FlowSuccess::Ok);
+                }
+
+                let mut w = writer.lock().map_err(|_| gst::FlowError::Error)?;
+                match w.publish(map.as_slice(), pts_ns) {
                     Ok(_) => return Ok(gst::FlowSuccess::Ok),
                     Err(crate::platform::ShmError::Exhausted) => {
                         drop(state);
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        thread::sleep(Duration::from_millis(1));
                     }
                     Err(crate::platform::ShmError::NoConsumer) if wait_for_connection => {
                         drop(state);
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        thread::sleep(Duration::from_millis(5));
                     }
                     Err(_) => return Err(gst::FlowError::Error),
                 }
@@ -259,6 +492,17 @@ mod imp {
         fn unlock_stop(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
             state.unlocked = false;
+            Ok(())
+        }
+
+        fn propose_allocation(
+            &self,
+            query: &mut gst::query::Allocation,
+        ) -> Result<(), gst::LoggableError> {
+            let state = self.state.lock().expect("state poisoned");
+            if let Some(allocator) = &state.allocator {
+                query.add_allocation_param(Some(allocator), gst::AllocationParams::default());
+            }
             Ok(())
         }
     }
