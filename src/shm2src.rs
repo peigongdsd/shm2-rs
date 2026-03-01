@@ -57,6 +57,8 @@ struct TimelineState {
     last_late_log_ns: u64,
     startup_gen: u64,
     startup_ready_sent: bool,
+    startup_snap_seq: u64,
+    saw_running: bool,
 }
 
 #[derive(Default)]
@@ -333,6 +335,8 @@ mod imp {
             state.timeline.last_late_log_ns = 0;
             state.timeline.startup_gen = startup.generation;
             state.timeline.startup_ready_sent = false;
+            state.timeline.startup_snap_seq = snap.seq;
+            state.timeline.saw_running = false;
 
             if let Some(t) = state.hb_thread.take() {
                 let _ = t.join();
@@ -371,6 +375,8 @@ mod imp {
             state.timeline.last_late_log_ns = 0;
             state.timeline.startup_gen = 0;
             state.timeline.startup_ready_sent = false;
+            state.timeline.startup_snap_seq = 0;
+            state.timeline.saw_running = false;
             if let Some(stop) = state.hb_stop.take() {
                 stop.store(true, Ordering::Relaxed);
             }
@@ -436,6 +442,8 @@ mod imp {
                         state.timeline.offset_valid = false;
                         state.timeline.last_snapshot_seq = 0;
                         state.timeline.need_discont = true;
+                        state.timeline.startup_snap_seq = r.timeline_snapshot().seq;
+                        state.timeline.saw_running = false;
                     }
                     if startup.state != STARTUP_RUNNING {
                         if startup.state == STARTUP_SINK_READY
@@ -446,6 +454,18 @@ mod imp {
                                 startup.generation
                             );
                             let snap = r.timeline_snapshot();
+                            if snap.seq == state.timeline.startup_snap_seq {
+                                drop(r);
+                                if let Some(buf) = black_buffer(&self.obj(), now_rt) {
+                                    return Ok(
+                                        gst_base::subclass::base_src::CreateSuccess::NewBuffer(
+                                            buf,
+                                        ),
+                                    );
+                                }
+                                poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
+                                continue;
+                            }
                             if let Some(now) = now_rt {
                                 update_clock_sync(&mut state.timeline, snap, now);
                             }
@@ -453,6 +473,7 @@ mod imp {
                                 if r.set_startup_state(startup.generation, STARTUP_SRC_READY) {
                                     state.timeline.startup_ready_sent = true;
                                     state.timeline.need_discont = true;
+                                    state.timeline.startup_snap_seq = snap.seq;
                                     eprintln!(
                                         "[shm2] startup: src ready (gen {}), waiting RUNNING",
                                         startup.generation
@@ -474,6 +495,13 @@ mod imp {
                         }
                         poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
                         continue;
+                    } else if !state.timeline.saw_running {
+                        let snap = r.timeline_snapshot();
+                        if let Some(now) = now_rt {
+                            update_clock_sync(&mut state.timeline, snap, now);
+                        }
+                        state.timeline.need_discont = true;
+                        state.timeline.saw_running = true;
                     }
                 }
                 if latest_only {
