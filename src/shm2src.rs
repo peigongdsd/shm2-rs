@@ -167,13 +167,22 @@ mod imp {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
             let backend = PosixFileBackend;
-            let reader = Reader::open(&backend, &state.settings.shm_path).map_err(|err| {
+            let mut reader = Reader::open(&backend, &state.settings.shm_path).map_err(|err| {
                 gst::error_msg!(
                     gst::ResourceError::OpenRead,
                     [
                         "Failed to open shm reader at {}: {}",
                         state.settings.shm_path,
                         err
+                    ]
+                )
+            })?;
+            reader.claim_consumer(std::process::id()).map_err(|_| {
+                gst::error_msg!(
+                    gst::ResourceError::OpenRead,
+                    [
+                        "Another shm2src is already connected to {}",
+                        state.settings.shm_path
                     ]
                 )
             })?;
@@ -185,6 +194,11 @@ mod imp {
 
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
+            if let Some(reader) = state.reader.as_ref() {
+                if let Ok(mut r) = reader.lock() {
+                    r.release_consumer(std::process::id());
+                }
+            }
             state.reader = None;
             state.unlocked = false;
             Ok(())

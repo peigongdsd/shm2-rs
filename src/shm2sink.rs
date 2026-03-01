@@ -20,6 +20,8 @@ struct Settings {
     shm_path: String,
     shm_size: u64,
     perms: u32,
+    wait_for_connection: bool,
+    consumer_timeout_ms: u32,
 }
 
 impl Default for Settings {
@@ -28,6 +30,8 @@ impl Default for Settings {
             shm_path: DEFAULT_PATH.to_string(),
             shm_size: 64 * 1024 * 1024,
             perms: 0o660,
+            wait_for_connection: true,
+            consumer_timeout_ms: 1000,
         }
     }
 }
@@ -36,6 +40,7 @@ impl Default for Settings {
 struct State {
     settings: Settings,
     writer: Option<WriterType>,
+    unlocked: bool,
 }
 
 mod imp {
@@ -76,6 +81,20 @@ mod imp {
                         .maximum(0o7777)
                         .mutable_ready()
                         .build(),
+                    glib::ParamSpecBoolean::builder("wait-for-connection")
+                        .nick("Wait for connection")
+                        .blurb("Block rendering until a shm2src consumer is connected")
+                        .default_value(true)
+                        .mutable_ready()
+                        .build(),
+                    glib::ParamSpecUInt::builder("consumer-timeout-ms")
+                        .nick("Consumer timeout")
+                        .blurb("Consumer heartbeat timeout in milliseconds")
+                        .default_value(1000)
+                        .minimum(1)
+                        .maximum(60_000)
+                        .mutable_ready()
+                        .build(),
                 ]
             });
             PROPERTIES.as_ref()
@@ -99,6 +118,16 @@ mod imp {
                         state.settings.perms = v;
                     }
                 }
+                "wait-for-connection" => {
+                    if let Ok(v) = value.get::<bool>() {
+                        state.settings.wait_for_connection = v;
+                    }
+                }
+                "consumer-timeout-ms" => {
+                    if let Ok(v) = value.get::<u32>() {
+                        state.settings.consumer_timeout_ms = v;
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -109,6 +138,8 @@ mod imp {
                 "shm-path" => state.settings.shm_path.to_value(),
                 "shm-size" => state.settings.shm_size.to_value(),
                 "perms" => state.settings.perms.to_value(),
+                "wait-for-connection" => state.settings.wait_for_connection.to_value(),
+                "consumer-timeout-ms" => state.settings.consumer_timeout_ms.to_value(),
                 _ => unreachable!(),
             }
         }
@@ -171,6 +202,7 @@ mod imp {
 
             writer.set_running();
             state.writer = Some(writer);
+            state.unlocked = false;
             Ok(())
         }
 
@@ -180,6 +212,7 @@ mod imp {
                 writer.set_stopped();
             }
             state.writer = None;
+            state.unlocked = false;
             Ok(())
         }
 
@@ -187,12 +220,46 @@ mod imp {
             let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
             let pts_ns = buffer.pts().map(|v| v.nseconds() as i64).unwrap_or(-1);
 
+            loop {
+                let mut state = self.state.lock().expect("state poisoned");
+                if state.unlocked {
+                    return Err(gst::FlowError::Flushing);
+                }
+                let wait_for_connection = state.settings.wait_for_connection;
+                let timeout_ns = (state.settings.consumer_timeout_ms as u64) * 1_000_000;
+                let writer = state.writer.as_mut().ok_or(gst::FlowError::Flushing)?;
+
+                if wait_for_connection && !writer.is_consumer_online(timeout_ns) {
+                    drop(state);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+
+                match writer.publish(map.as_slice(), pts_ns) {
+                    Ok(_) => return Ok(gst::FlowSuccess::Ok),
+                    Err(crate::platform::ShmError::Exhausted) => {
+                        drop(state);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(crate::platform::ShmError::NoConsumer) if wait_for_connection => {
+                        drop(state);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return Err(gst::FlowError::Error),
+                }
+            }
+        }
+
+        fn unlock(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
-            let writer = state.writer.as_mut().ok_or(gst::FlowError::Flushing)?;
-            writer
-                .publish(map.as_slice(), pts_ns)
-                .map_err(|_| gst::FlowError::Error)?;
-            Ok(gst::FlowSuccess::Ok)
+            state.unlocked = true;
+            Ok(())
+        }
+
+        fn unlock_stop(&self) -> Result<(), gst::ErrorMessage> {
+            let mut state = self.state.lock().expect("state poisoned");
+            state.unlocked = false;
+            Ok(())
         }
     }
 }

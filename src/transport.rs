@@ -67,6 +67,7 @@ pub struct SharedHeader {
     pub features: u64,
     pub state: AtomicU32,
     pub owner_pid: u32,
+    pub consumer_owner_pid: AtomicU32,
     pub epoch: AtomicU64,
     pub producer_heartbeat_ns: AtomicU64,
     pub consumer_heartbeat_ns: AtomicU64,
@@ -210,6 +211,9 @@ impl<B: ShmBackend> Writer<B> {
     }
 
     pub fn publish(&mut self, payload: &[u8], pts_ns: i64) -> Result<u32, ShmError> {
+        if !self.is_consumer_online(1_000_000_000) {
+            return Err(ShmError::NoConsumer);
+        }
         self.drain_recycles();
 
         let alloc = self
@@ -304,6 +308,18 @@ impl<B: ShmBackend> Writer<B> {
         self.region.len()
     }
 
+    pub fn is_consumer_online(&self, timeout_ns: u64) -> bool {
+        let owner = self.hdr.consumer_owner_pid.load(Ordering::Acquire);
+        if owner == 0 {
+            return false;
+        }
+        let hb = self.hdr.consumer_heartbeat_ns.load(Ordering::Acquire);
+        if hb == 0 {
+            return false;
+        }
+        now_nanos().saturating_sub(hb) <= timeout_ns
+    }
+
     fn touch_producer_heartbeat(&self) {
         self.hdr
             .producer_heartbeat_ns
@@ -382,6 +398,7 @@ impl<B: ShmBackend> Reader<B> {
         let head = self.hdr.ready_head.load(Ordering::Acquire);
         let tail = self.hdr.ready_tail.load(Ordering::Relaxed);
         if head == tail {
+            self.touch_consumer_heartbeat();
             return Ok(None);
         }
 
@@ -452,6 +469,34 @@ impl<B: ShmBackend> Reader<B> {
         self.hdr
             .consumer_heartbeat_ns
             .store(now_nanos(), Ordering::Relaxed);
+    }
+
+    pub fn claim_consumer(&mut self, pid: u32) -> Result<(), ShmError> {
+        match self.hdr.consumer_owner_pid.compare_exchange(
+            0,
+            pid,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.touch_consumer_heartbeat();
+                Ok(())
+            }
+            Err(current) if current == pid => {
+                self.touch_consumer_heartbeat();
+                Ok(())
+            }
+            Err(_) => Err(ShmError::Protocol("another consumer already connected")),
+        }
+    }
+
+    pub fn release_consumer(&mut self, pid: u32) {
+        let _ = self.hdr.consumer_owner_pid.compare_exchange(
+            pid,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn validate_bounds(&self, offset: u64, len: usize) -> Result<(), ShmError> {
@@ -537,6 +582,7 @@ fn init_header(
     hdr.features = 0;
     hdr.state.store(STATE_INIT, Ordering::Relaxed);
     hdr.owner_pid = std::process::id();
+    hdr.consumer_owner_pid.store(0, Ordering::Relaxed);
     hdr.epoch.store(1, Ordering::Relaxed);
     hdr.producer_heartbeat_ns
         .store(now_nanos(), Ordering::Relaxed);

@@ -9,6 +9,7 @@ pub enum ShmError {
     InvalidConfig(&'static str),
     Protocol(&'static str),
     Exhausted,
+    NoConsumer,
     RingFull,
     RingEmpty,
 }
@@ -20,6 +21,7 @@ impl fmt::Display for ShmError {
             ShmError::InvalidConfig(s) => write!(f, "invalid config: {s}"),
             ShmError::Protocol(s) => write!(f, "protocol error: {s}"),
             ShmError::Exhausted => write!(f, "allocator exhausted"),
+            ShmError::NoConsumer => write!(f, "no active consumer connected"),
             ShmError::RingFull => write!(f, "ring full"),
             ShmError::RingEmpty => write!(f, "ring empty"),
         }
