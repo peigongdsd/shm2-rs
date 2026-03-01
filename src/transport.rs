@@ -657,14 +657,17 @@ impl Reader {
 
         let len = head.saturating_sub(tail);
         let mut dropped = 0u64;
-        let mut chosen = tail;
-        // Live policy (newest):
-        // len==1 -> consume oldest
-        // len>=2 -> consume newest, drop everything older
-        if len >= 2 {
+        let chosen;
+        // Live policy (second-newest):
+        // len==1 -> consume newest (only entry)
+        // len>=2 -> consume second-newest, drop everything older than it,
+        //           keep newest in the ring.
+        if len == 1 {
+            chosen = tail;
+        } else {
+            chosen = head - 2;
             let mut cur = tail;
-            let stop = head - 1;
-            while cur < stop {
+            while cur < chosen {
                 let idx = (cur % cap) as usize;
                 let desc = self.ready[idx];
                 if !self.try_recycle_desc(desc.buffer_id, desc.offset, desc.length, 1) {
@@ -673,7 +676,6 @@ impl Reader {
                 dropped += 1;
                 cur += 1;
             }
-            chosen = head - 1;
         }
 
         let chosen_idx = (chosen % cap) as usize;
@@ -691,8 +693,8 @@ impl Reader {
 
         self.validate_bounds(out.offset, out.len as usize)?;
 
-        // Advance tail to skip everything up to the chosen entry (and any dropped oldest entry).
-        let new_tail = if chosen >= tail { chosen + 1 } else { head };
+        // Advance tail to keep only the newest entry when possible.
+        let new_tail = if len <= 1 { head } else { head - 1 };
         self.hdr.ready_tail.store(new_tail, Ordering::Release);
         self.touch_consumer_heartbeat();
         Ok(Some((out, dropped)))
