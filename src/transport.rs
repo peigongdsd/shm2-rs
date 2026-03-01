@@ -265,7 +265,19 @@ impl Writer {
     pub fn publish(&mut self, payload: &[u8], pts_ns: i64) -> Result<u32, ShmError> {
         let lease = self.alloc_lease(payload.len() as u32, self.allocator_align)?;
         unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), lease.ptr, payload.len());
+            let arena_start = self.arena as usize;
+            let arena_end = arena_start + (self.hdr.arena_size as usize);
+            let src = payload.as_ptr() as usize;
+            let src_end = src + payload.len();
+            let dst = lease.ptr as usize;
+            let dst_end = dst + payload.len();
+            let in_arena = src >= arena_start && src_end <= arena_end;
+            let overlap = src < dst_end && dst < src_end;
+            if in_arena && overlap {
+                std::ptr::copy(payload.as_ptr(), lease.ptr, payload.len());
+            } else {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), lease.ptr, payload.len());
+            }
         }
         if let Err(err) = self.publish_lease(lease, pts_ns) {
             let _ = self.free_lease(lease.buffer_id);

@@ -124,6 +124,10 @@ impl AllocTracker {
             ptr: key as *mut u8,
         })
     }
+
+    fn reset_pending(&mut self) {
+        self.pending_by_ptr.clear();
+    }
 }
 
 struct ShmWritableMemory {
@@ -479,6 +483,15 @@ mod imp {
                         // Consumer went away without recycling outstanding buffers.
                         // Reclaim arena to avoid permanent allocator exhaustion.
                         w.reset_allocator_state();
+                        if let Some(alloc) = allocator.as_ref() {
+                            if let Ok(mut tracker_guard) = alloc.imp().tracker.lock() {
+                                if let Some(tracker) = tracker_guard.as_mut() {
+                                    if let Ok(mut t) = tracker.lock() {
+                                        t.reset_pending();
+                                    }
+                                }
+                            }
+                        }
                     }
                     is_online
                 };
