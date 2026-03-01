@@ -28,6 +28,7 @@ struct Settings {
     shm_path: String,
     is_live: bool,
     live_only: bool,
+    latest_only: bool,
 }
 
 impl Default for Settings {
@@ -36,6 +37,7 @@ impl Default for Settings {
             shm_path: DEFAULT_PATH.to_string(),
             is_live: false,
             live_only: true,
+            latest_only: true,
         }
     }
 }
@@ -176,6 +178,12 @@ mod imp {
                         .default_value(true)
                         .mutable_ready()
                         .build(),
+                    glib::ParamSpecBoolean::builder("latest-only")
+                        .nick("Latest only")
+                        .blurb("Always take newest available frame and drop older queued frames")
+                        .default_value(true)
+                        .mutable_ready()
+                        .build(),
                 ]
             });
             PROPERTIES.as_ref()
@@ -200,6 +208,11 @@ mod imp {
                         state.settings.live_only = v;
                     }
                 }
+                "latest-only" => {
+                    if let Ok(v) = value.get::<bool>() {
+                        state.settings.latest_only = v;
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -210,6 +223,7 @@ mod imp {
                 "shm-path" => state.settings.shm_path.to_value(),
                 "is-live" => state.settings.is_live.to_value(),
                 "live-only" => state.settings.live_only.to_value(),
+                "latest-only" => state.settings.latest_only.to_value(),
                 _ => unreachable!(),
             }
         }
@@ -364,23 +378,43 @@ mod imp {
             };
 
             let mut idle_cycles = 0u32;
-            let (desc, ptr, snap, dropped) = loop {
+            let (desc, ptr, snap, dropped, _latest_only) = loop {
                 {
                     let state = self.state.lock().expect("state poisoned");
                     if state.unlocked {
                         return Err(gst::FlowError::Flushing);
                     }
                 }
-                let mut r = reader.lock().map_err(|_| gst::FlowError::Error)?;
-                match r.try_recv_latest_desc().map_err(|_| gst::FlowError::Error)? {
-                    Some((desc, dropped)) => {
-                        let ptr = r.payload_ptr(&desc).map_err(|_| gst::FlowError::Error)?;
-                        let snap = r.timeline_snapshot();
-                        break (desc, ptr, snap, dropped);
+                let (latest_only, mut r) = {
+                    let state = self.state.lock().expect("state poisoned");
+                    (state.settings.latest_only, reader.lock().map_err(|_| gst::FlowError::Error)?)
+                };
+                if latest_only {
+                    match r
+                        .try_recv_latest_desc()
+                        .map_err(|_| gst::FlowError::Error)?
+                    {
+                        Some((desc, dropped)) => {
+                            let ptr = r.payload_ptr(&desc).map_err(|_| gst::FlowError::Error)?;
+                            let snap = r.timeline_snapshot();
+                            break (desc, ptr, snap, dropped, latest_only);
+                        }
+                        None => {
+                            drop(r);
+                            poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
+                        }
                     }
-                    None => {
-                        drop(r);
-                        poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
+                } else {
+                    match r.try_recv_desc().map_err(|_| gst::FlowError::Error)? {
+                        Some(desc) => {
+                            let ptr = r.payload_ptr(&desc).map_err(|_| gst::FlowError::Error)?;
+                            let snap = r.timeline_snapshot();
+                            break (desc, ptr, snap, 0, latest_only);
+                        }
+                        None => {
+                            drop(r);
+                            poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
+                        }
                     }
                 }
             };
