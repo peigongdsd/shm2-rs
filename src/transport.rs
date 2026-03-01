@@ -518,6 +518,12 @@ impl Reader {
     }
 
     pub fn claim_consumer(&mut self, pid: u32) -> Result<(), ShmError> {
+        let resync_to_latest = || {
+            // On (re)attach, skip stale queued frames and start from the latest point.
+            let head = self.hdr.ready_head.load(Ordering::Acquire);
+            self.hdr.ready_tail.store(head, Ordering::Release);
+        };
+
         match self.hdr.consumer_owner_pid.compare_exchange(
             0,
             pid,
@@ -525,10 +531,12 @@ impl Reader {
             Ordering::Acquire,
         ) {
             Ok(_) => {
+                resync_to_latest();
                 self.touch_consumer_heartbeat();
                 Ok(())
             }
             Err(current) if current == pid => {
+                resync_to_latest();
                 self.touch_consumer_heartbeat();
                 Ok(())
             }
