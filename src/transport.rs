@@ -8,12 +8,17 @@ use crate::platform::{SharedRegion, ShmBackend, ShmError};
 
 pub const MAGIC: [u8; 8] = *b"GSTSHM2\0";
 pub const VERSION_MAJOR: u16 = 1;
-pub const VERSION_MINOR: u16 = 0;
+pub const VERSION_MINOR: u16 = 1;
 
 const STATE_INIT: u32 = 0;
 const STATE_RUNNING: u32 = 1;
 const STATE_STOPPING: u32 = 2;
 const STATE_STOPPED: u32 = 3;
+
+pub const STARTUP_IDLE: u32 = 0;
+pub const STARTUP_SINK_READY: u32 = 1;
+pub const STARTUP_SRC_READY: u32 = 2;
+pub const STARTUP_RUNNING: u32 = 3;
 
 const HEADER_PAD: usize = 4096;
 const DESC_ALIGN: usize = 64;
@@ -115,6 +120,11 @@ pub struct SharedHeader {
     pub timeline_sink_mono_ns: AtomicU64,
     pub timeline_producer_pts_ns: AtomicU64,
     pub timeline_ready_head: AtomicU64,
+
+    // Startup synchronization handshake.
+    pub startup_gen: AtomicU64,
+    pub startup_state: AtomicU32,
+    pub startup_seq: AtomicU64,
 }
 
 pub struct TransportConfig {
@@ -173,6 +183,13 @@ pub struct TimelineSnapshot {
     pub sink_mono_ns: u64,
     pub producer_pts_ns: i64,
     pub ready_head: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StartupSnapshot {
+    pub generation: u64,
+    pub state: u32,
+    pub seq: u64,
 }
 
 // Writer/Reader are guarded externally by element mutexes.
@@ -376,6 +393,11 @@ impl Writer {
         }
     }
 
+    pub fn emit_timeline_snapshot(&mut self, producer_pts_ns: i64) {
+        let head = self.hdr.ready_head.load(Ordering::Relaxed);
+        self.force_timeline_snapshot(producer_pts_ns, head);
+    }
+
     pub fn drain_recycles(&mut self) {
         let cap = u64::from(self.hdr.rec_capacity);
         loop {
@@ -488,7 +510,12 @@ impl Writer {
         if !generation_changed && !periodic_due {
             return;
         }
+        self.force_timeline_snapshot(producer_pts_ns, ready_head);
+    }
 
+    fn force_timeline_snapshot(&mut self, producer_pts_ns: i64, ready_head: u64) {
+        let now = now_nanos();
+        let generation = self.hdr.timeline_gen.load(Ordering::Acquire);
         self.hdr.timeline_sink_mono_ns.store(now, Ordering::Relaxed);
         self.hdr
             .timeline_producer_pts_ns
@@ -501,9 +528,25 @@ impl Writer {
             .store(generation, Ordering::Relaxed);
         self.hdr.timeline_seq.fetch_add(1, Ordering::AcqRel);
         self.hdr.timeline_valid.store(1, Ordering::Release);
-
         self.last_timeline_emit_ns = now;
         self.last_timeline_snapshot_gen = generation;
+    }
+
+    pub fn startup_snapshot(&self) -> StartupSnapshot {
+        StartupSnapshot {
+            generation: self.hdr.startup_gen.load(Ordering::Acquire),
+            state: self.hdr.startup_state.load(Ordering::Acquire),
+            seq: self.hdr.startup_seq.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn set_startup_state(&self, generation: u64, state: u32) -> bool {
+        if self.hdr.startup_gen.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        self.hdr.startup_state.store(state, Ordering::Release);
+        self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
+        true
     }
 }
 
@@ -734,6 +777,23 @@ impl Reader {
         }
     }
 
+    pub fn startup_snapshot(&self) -> StartupSnapshot {
+        StartupSnapshot {
+            generation: self.hdr.startup_gen.load(Ordering::Acquire),
+            state: self.hdr.startup_state.load(Ordering::Acquire),
+            seq: self.hdr.startup_seq.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn set_startup_state(&self, generation: u64, state: u32) -> bool {
+        if self.hdr.startup_gen.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        self.hdr.startup_state.store(state, Ordering::Release);
+        self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
     pub fn consumer_heartbeat_tick(&self) {
         self.touch_consumer_heartbeat();
     }
@@ -760,6 +820,9 @@ impl Reader {
             Ok(_) => {
                 self.hdr.timeline_gen.fetch_add(1, Ordering::AcqRel);
                 self.hdr.timeline_valid.store(0, Ordering::Release);
+                let _gen = self.hdr.startup_gen.fetch_add(1, Ordering::AcqRel) + 1;
+                self.hdr.startup_state.store(STARTUP_SINK_READY, Ordering::Release);
+                self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
                 resync_to_latest();
                 self.touch_consumer_heartbeat();
                 Ok(())
@@ -767,6 +830,9 @@ impl Reader {
             Err(current) if current == pid => {
                 self.hdr.timeline_gen.fetch_add(1, Ordering::AcqRel);
                 self.hdr.timeline_valid.store(0, Ordering::Release);
+                let _gen = self.hdr.startup_gen.fetch_add(1, Ordering::AcqRel) + 1;
+                self.hdr.startup_state.store(STARTUP_SINK_READY, Ordering::Release);
+                self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
                 resync_to_latest();
                 self.touch_consumer_heartbeat();
                 Ok(())
@@ -903,6 +969,9 @@ fn init_header(
     hdr.timeline_sink_mono_ns.store(0, Ordering::Relaxed);
     hdr.timeline_producer_pts_ns.store(0, Ordering::Relaxed);
     hdr.timeline_ready_head.store(0, Ordering::Relaxed);
+    hdr.startup_gen.store(0, Ordering::Relaxed);
+    hdr.startup_state.store(STARTUP_IDLE, Ordering::Relaxed);
+    hdr.startup_seq.store(0, Ordering::Relaxed);
     hdr.state.store(STATE_RUNNING, Ordering::Release);
 }
 

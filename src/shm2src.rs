@@ -11,10 +11,13 @@ use gst_base::prelude::*;
 use gst_base::subclass::prelude::*;
 use gstreamer as gst;
 use gstreamer_base as gst_base;
+use gstreamer_video as gst_video;
 use once_cell::sync::Lazy;
 
 use crate::platform::resolve_backend;
-use crate::transport::{Reader, ReceivedDesc, TimelineSnapshot};
+use crate::transport::{
+    Reader, ReceivedDesc, TimelineSnapshot, STARTUP_RUNNING, STARTUP_SINK_READY, STARTUP_SRC_READY,
+};
 
 type ReaderType = Reader;
 
@@ -52,6 +55,8 @@ struct TimelineState {
     producer_pts_at_snap: i64,
     need_discont: bool,
     last_late_log_ns: u64,
+    startup_gen: u64,
+    startup_ready_sent: bool,
 }
 
 #[derive(Default)]
@@ -132,6 +137,34 @@ fn update_clock_sync(ts: &mut TimelineState, snap: TimelineSnapshot, local_now_n
     ts.last_snapshot_seq = snap.seq;
     ts.sink_mono_at_snap = snap.sink_mono_ns;
     ts.producer_pts_at_snap = snap.producer_pts_ns;
+}
+
+fn black_buffer(
+    obj: &crate::shm2src::Shm2Src,
+    now_ns: Option<u64>,
+) -> Option<gst::Buffer> {
+    let caps = obj.src_pad().current_caps()?;
+    let info = gst_video::VideoInfo::from_caps(&caps).ok()?;
+    let mut buf = gst::Buffer::with_size(info.size()).ok()?;
+    if let Some(b) = buf.get_mut() {
+        if let Ok(mut map) = b.map_writable() {
+            for byte in map.as_mut_slice() {
+                *byte = 0;
+            }
+        }
+        if let Some(now) = now_ns {
+            b.set_pts(gst::ClockTime::from_nseconds(now));
+        }
+        let fps = info.fps();
+        if fps.numer() > 0 {
+            let dur = (1_000_000_000u64)
+                .saturating_mul(fps.denom() as u64)
+                / (fps.numer() as u64);
+            b.set_duration(gst::ClockTime::from_nseconds(dur));
+        }
+        b.set_flags(gst::BufferFlags::DISCONT);
+    }
+    Some(buf)
 }
 
 mod imp {
@@ -286,6 +319,7 @@ mod imp {
             })?;
             self.obj().set_format(gst::Format::Time);
             let snap = reader.timeline_snapshot();
+            let startup = reader.startup_snapshot();
             self.obj().set_live(state.settings.is_live);
             state.reader = Some(Arc::new(Mutex::new(reader)));
             state.unlocked = false;
@@ -297,6 +331,8 @@ mod imp {
             state.timeline.producer_pts_at_snap = 0;
             state.timeline.need_discont = true;
             state.timeline.last_late_log_ns = 0;
+            state.timeline.startup_gen = startup.generation;
+            state.timeline.startup_ready_sent = false;
 
             if let Some(t) = state.hb_thread.take() {
                 let _ = t.join();
@@ -333,6 +369,8 @@ mod imp {
             state.timeline.producer_pts_at_snap = 0;
             state.timeline.need_discont = true;
             state.timeline.last_late_log_ns = 0;
+            state.timeline.startup_gen = 0;
+            state.timeline.startup_ready_sent = false;
             if let Some(stop) = state.hb_stop.take() {
                 stop.store(true, Ordering::Relaxed);
             }
@@ -388,6 +426,56 @@ mod imp {
                     let state = self.state.lock().expect("state poisoned");
                     (state.settings.latest_only, reader.lock().map_err(|_| gst::FlowError::Error)?)
                 };
+                let startup = r.startup_snapshot();
+                let now_rt = current_running_time_ns(&self.obj());
+                {
+                    let mut state = self.state.lock().expect("state poisoned");
+                    if startup.generation != state.timeline.startup_gen {
+                        state.timeline.startup_gen = startup.generation;
+                        state.timeline.startup_ready_sent = false;
+                        state.timeline.offset_valid = false;
+                        state.timeline.last_snapshot_seq = 0;
+                        state.timeline.need_discont = true;
+                    }
+                    if startup.state != STARTUP_RUNNING {
+                        if startup.state == STARTUP_SINK_READY
+                            && !state.timeline.startup_ready_sent
+                        {
+                            eprintln!(
+                                "[shm2] startup: sink ready (gen {}), syncing clock",
+                                startup.generation
+                            );
+                            let snap = r.timeline_snapshot();
+                            if let Some(now) = now_rt {
+                                update_clock_sync(&mut state.timeline, snap, now);
+                            }
+                            if snap.valid {
+                                if r.set_startup_state(startup.generation, STARTUP_SRC_READY) {
+                                    state.timeline.startup_ready_sent = true;
+                                    state.timeline.need_discont = true;
+                                    eprintln!(
+                                        "[shm2] startup: src ready (gen {}), waiting RUNNING",
+                                        startup.generation
+                                    );
+                                }
+                            }
+                        }
+                        if startup.state != STARTUP_SINK_READY {
+                            eprintln!(
+                                "[shm2] startup: waiting (gen {} state {})",
+                                startup.generation, startup.state
+                            );
+                        }
+                        drop(r);
+                        if let Some(buf) = black_buffer(&self.obj(), now_rt) {
+                            return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
+                                buf,
+                            ));
+                        }
+                        poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
+                        continue;
+                    }
+                }
                 if latest_only {
                     match r
                         .try_recv_latest_desc()
@@ -396,7 +484,7 @@ mod imp {
                         Some((desc, dropped)) => {
                             let ptr = r.payload_ptr(&desc).map_err(|_| gst::FlowError::Error)?;
                             let snap = r.timeline_snapshot();
-                        break (desc, ptr, snap, dropped);
+                            break (desc, ptr, snap, dropped);
                         }
                         None => {
                             drop(r);

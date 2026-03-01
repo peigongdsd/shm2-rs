@@ -14,7 +14,9 @@ use gstreamer_base as gst_base;
 use once_cell::sync::Lazy;
 
 use crate::platform::resolve_backend;
-use crate::transport::{AllocLease, TransportConfig, Writer};
+use crate::transport::{
+    AllocLease, TransportConfig, Writer, STARTUP_RUNNING, STARTUP_SRC_READY,
+};
 
 type WriterType = Writer;
 
@@ -502,6 +504,27 @@ mod imp {
                     drop(state);
                     poll_yield_sleep(&mut idle_no_consumer, Duration::from_millis(5));
                     continue;
+                }
+
+                {
+                    let mut w = writer.lock().map_err(|_| gst::FlowError::Error)?;
+                    let startup = w.startup_snapshot();
+                    if startup.state != STARTUP_RUNNING {
+                        if startup.state == STARTUP_SRC_READY {
+                            eprintln!(
+                                "[shm2] startup: src ready (gen {}), switching to RUNNING",
+                                startup.generation
+                            );
+                            let _ = w.set_startup_state(startup.generation, STARTUP_RUNNING);
+                        } else {
+                            eprintln!(
+                                "[shm2] startup: waiting (gen {} state {})",
+                                startup.generation, startup.state
+                            );
+                        }
+                        w.emit_timeline_snapshot(pts_ns);
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
                 }
 
                 // Sink fast path: upstream memory came from our SHM allocator.
