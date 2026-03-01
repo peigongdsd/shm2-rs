@@ -54,6 +54,7 @@ struct State {
     writer: Option<Arc<Mutex<WriterType>>>,
     allocator: Option<ShmArenaAllocator>,
     unlocked: bool,
+    was_consumer_online: bool,
     hb_stop: Option<Arc<AtomicBool>>,
     hb_thread: Option<std::thread::JoinHandle<()>>,
     gc_stop: Option<Arc<AtomicBool>>,
@@ -377,7 +378,39 @@ mod imp {
         }
     }
 
+    impl Shm2Sink {
+        fn reset_upstream_timing(&self) {
+            let Some(pad) = self.obj().static_pad("sink") else {
+                return;
+            };
+            let _ = pad.send_event(gst::event::FlushStart::new());
+            let _ = pad.send_event(gst::event::FlushStop::new(false));
+            let now = self
+                .obj()
+                .clock()
+                .and_then(|c| c.time())
+                .map(|t| t.nseconds())
+                .unwrap_or(0);
+            let base = self
+                .obj()
+                .base_time()
+                .map(|t| t.nseconds())
+                .unwrap_or(0);
+            let running = now.saturating_sub(base);
+            let seek = gst::event::Seek::new(
+                1.0,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::SeekType::Set,
+                gst::ClockTime::from_nseconds(running),
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+            );
+            let _ = pad.send_event(seek);
+        }
+    }
+
     impl BaseSinkImpl for Shm2Sink {
+
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             let mut state = self.state.lock().expect("state poisoned");
             let cfg = TransportConfig {
@@ -416,6 +449,7 @@ mod imp {
             state.writer = Some(writer);
             state.allocator = Some(allocator);
             state.unlocked = false;
+            state.was_consumer_online = false;
 
             if let Some(t) = state.hb_thread.take() {
                 let _ = t.join();
@@ -472,6 +506,7 @@ mod imp {
             state.allocator = None;
             state.writer = None;
             state.unlocked = false;
+            state.was_consumer_online = false;
             Ok(())
         }
 
@@ -482,7 +517,7 @@ mod imp {
             let mut idle_no_space = 0u32;
 
             loop {
-                let state = self.state.lock().expect("state poisoned");
+                let mut state = self.state.lock().expect("state poisoned");
                 if state.unlocked {
                     return Err(gst::FlowError::Flushing);
                 }
@@ -499,6 +534,11 @@ mod imp {
                     let w = writer.lock().map_err(|_| gst::FlowError::Error)?;
                     w.is_consumer_online(timeout_ns)
                 };
+                if online && !state.was_consumer_online {
+                    eprintln!("[shm2] consumer online, resetting upstream timing");
+                    self.reset_upstream_timing();
+                }
+                state.was_consumer_online = online;
 
                 if wait_for_connection && !online {
                     drop(state);
