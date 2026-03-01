@@ -1,6 +1,6 @@
 # shm2-rs
 
-SHM-only transport prototype for GStreamer, designed to communicate exclusively through a single shared-memory region (for example `/dev/shm/gst-shm2-demo`) with no control socket.
+SHM-only transport prototype for GStreamer, designed to communicate exclusively through a single shared-memory region (for example `shm:///dev/shm/gst-shm2-demo` on Linux or `winshm://Local/gst-shm2-demo` on Windows) with no control socket.
 
 ## Current Status
 
@@ -10,7 +10,9 @@ Implemented:
   - producer->consumer ready ring
   - consumer->producer recycle ring
   - producer-side free-list allocator
-- OS backend abstraction (`platform`), with Linux POSIX shared-file backend implemented.
+- OS backend abstraction (`platform`) with runtime backend selection from `shm-path`.
+- Linux POSIX shared-file backend.
+- Windows named shared-memory backend (`winshm://...`).
 - Two standalone test binaries:
   - `shm2_producer`
   - `shm2_consumer`
@@ -20,7 +22,7 @@ Implemented:
 
 Current plugin status:
 - `shm2src`: **zero-copy output path implemented** (SHM-backed `GstMemory` + recycle on memory drop).
-- `shm2sink`: still uses copy-path from incoming upstream buffers into SHM (sink-side upstream allocator fast path not yet implemented).
+- `shm2sink`: **upstream zero-copy fast path implemented** via `propose_allocation` + custom allocator, with copy fallback for non-cooperating upstream memory.
 
 ## Repository Layout
 
@@ -48,16 +50,39 @@ cargo build --lib
 cargo test
 ```
 
+## shm-path URI Schemes
+
+`shm-path` is backend-aware and supports URI-like schemes:
+
+- Linux POSIX file backend:
+  - `shm:///dev/shm/gst-shm2-demo`
+  - backward-compatible plain path also works: `/dev/shm/gst-shm2-demo`
+- Windows named shared memory backend:
+  - `winshm://Local/gst-shm2-demo` (recommended default)
+  - `winshm://Global/gst-shm2-demo` (may require elevated privilege/service context)
+
+Both producer and consumer must use the exact same `shm-path` value.
+
 ## Run Transport Smoke Test
 
-Terminal 1:
+Linux (terminal 1):
 ```bash
-cargo run --bin shm2_consumer -- /dev/shm/gst-shm2-demo 2000
+cargo run --bin shm2_consumer -- shm:///dev/shm/gst-shm2-demo 2000
 ```
 
-Terminal 2:
+Linux (terminal 2):
 ```bash
-cargo run --bin shm2_producer -- /dev/shm/gst-shm2-demo 2000
+cargo run --bin shm2_producer -- shm:///dev/shm/gst-shm2-demo 2000
+```
+
+Windows (PowerShell window 1):
+```powershell
+cargo run --bin shm2_consumer -- winshm://Local/gst-shm2-demo 2000
+```
+
+Windows (PowerShell window 2):
+```powershell
+cargo run --bin shm2_producer -- winshm://Local/gst-shm2-demo 2000
 ```
 
 ## Plugin Discovery
@@ -83,14 +108,14 @@ Terminal 1 (producer pipeline):
 gst-launch-1.0 -v \
   videotestsrc is-live=true pattern=ball ! \
   video/x-raw,format=I420,width=320,height=240,framerate=30/1 ! \
-  shm2sink shm-path=/dev/shm/gst-shm2-pipe
+  shm2sink shm-path=shm:///dev/shm/gst-shm2-pipe
 ```
 
 Terminal 2 (consumer pipeline):
 
 ```bash
 gst-launch-1.0 -v \
-  shm2src shm-path=/dev/shm/gst-shm2-pipe is-live=true ! \
+  shm2src shm-path=shm:///dev/shm/gst-shm2-pipe is-live=true ! \
   queue ! videoconvert ! autovideosink
 ```
 
@@ -101,30 +126,24 @@ Terminal 1:
 gst-launch-1.0 -v \
   audiotestsrc is-live=true wave=sine ! \
   audio/x-raw,format=S16LE,channels=2,rate=48000 ! \
-  shm2sink shm-path=/dev/shm/gst-shm2-audio
+  shm2sink shm-path=shm:///dev/shm/gst-shm2-audio
 ```
 
 Terminal 2:
 ```bash
 gst-launch-1.0 -v \
-  shm2src shm-path=/dev/shm/gst-shm2-audio is-live=true ! \
+  shm2src shm-path=shm:///dev/shm/gst-shm2-audio is-live=true ! \
   queue ! audioconvert ! audioresample ! autoaudiosink
 ```
 
 Notes:
 - Start producer before consumer with current startup behavior (`shm2src` expects SHM region to exist at start).
-- `shm2src` is zero-copy on output; `shm2sink` is still copy-path on input.
-- `shm-path` must point to the same shared-memory file on both sides.
+- `shm2src` is zero-copy on output.
+- `shm2sink` uses zero-copy fast path when upstream adopts the proposed allocator; otherwise it falls back to copy.
+- `shm-path` must resolve to the same shared-memory region on both sides.
 
 ## Limitations (Known)
 
-- No custom GstAllocator/propose-allocation sink fast path yet (upstream->sink still copied into SHM).
-- `shm2src` currently requires producer/SHM file to exist when source starts.
-- No full stress/fault-recovery automated test matrix yet.
-
-## Next Steps
-
-1. Implement zero-copy descriptor path in `Reader`.
-2. Add custom GstMemory/finalizer recycling in `shm2src`.
-3. Add custom allocator + `propose_allocation` in `shm2sink`.
-4. Add integration tests for real pipelines and crash/restart behavior.
+- `shm2src` currently requires producer/SHM region to exist when source starts.
+- No full stress/fault-recovery automated CI matrix yet.
+- ivshmem/BAR backend is not implemented yet.
