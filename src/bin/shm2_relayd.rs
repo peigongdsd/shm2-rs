@@ -47,6 +47,10 @@ fn parse_listen(spec: &str) -> Result<ListenSpec, String> {
     Err("listen must be tcp://host:port or vsock://cid:port".to_string())
 }
 
+fn normalize_pipeline(input: &str) -> String {
+    input.replace("\\!", "!")
+}
+
 fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>), String> {
     let mut listen = "tcp://0.0.0.0:5555".to_string();
     let mut shm_path: Option<String> = None;
@@ -88,7 +92,13 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>), Str
     let input = input.ok_or("--input is required")?;
     let listen = parse_listen(&listen)?;
 
-    Ok((listen, shm_path, shm_size, input, splash))
+    Ok((
+        listen,
+        shm_path,
+        shm_size,
+        normalize_pipeline(&input),
+        splash.map(|p| normalize_pipeline(&p)),
+    ))
 }
 
 fn usage() {
