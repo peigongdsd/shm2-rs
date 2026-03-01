@@ -378,42 +378,6 @@ mod imp {
         }
     }
 
-    impl Shm2Sink {
-        fn reset_upstream_timing(&self) {
-            let Some(pad) = self.obj().static_pad("sink") else {
-                eprintln!("[shm2] timing reset: missing sink pad");
-                return;
-            };
-            let flush_start_ok = pad.send_event(gst::event::FlushStart::new());
-            let flush_stop_ok = pad.send_event(gst::event::FlushStop::new(false));
-            let now = self
-                .obj()
-                .clock()
-                .and_then(|c| c.time())
-                .map(|t| t.nseconds())
-                .unwrap_or(0);
-            let base = self
-                .obj()
-                .base_time()
-                .map(|t| t.nseconds())
-                .unwrap_or(0);
-            let running = now.saturating_sub(base);
-            let seek = gst::event::Seek::new(
-                1.0,
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                gst::SeekType::Set,
-                gst::ClockTime::from_nseconds(running),
-                gst::SeekType::None,
-                gst::ClockTime::NONE,
-            );
-            let seek_ok = pad.send_event(seek);
-            eprintln!(
-                "[shm2] timing reset: flush_start={} flush_stop={} seek={} now_ns={} base_ns={} running_ns={}",
-                flush_start_ok, flush_stop_ok, seek_ok, now, base, running
-            );
-        }
-    }
-
     impl BaseSinkImpl for Shm2Sink {
 
         fn start(&self) -> Result<(), gst::ErrorMessage> {
@@ -544,10 +508,6 @@ mod imp {
                         "[shm2] consumer_online {} -> {} (timeout_ns={})",
                         state.was_consumer_online, online, timeout_ns
                     );
-                }
-                if online && !state.was_consumer_online {
-                    eprintln!("[shm2] consumer online, resetting upstream timing");
-                    self.reset_upstream_timing();
                 }
                 state.was_consumer_online = online;
 
