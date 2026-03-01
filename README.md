@@ -60,8 +60,12 @@ cargo test
 - Windows named shared memory backend:
   - `winshm://Local/gst-shm2-demo` (recommended default)
   - `winshm://Global/gst-shm2-demo` (may require elevated privilege/service context)
+- Windows ivshmem backend (guest attach to existing shared BAR2 region):
+  - `ivshmem://PCI\VEN_1AF4&DEV_1110&SUBSYS_11001AF4&REV_01\3&11583659&0&88`
+  - `ivshmem://\\?\PCI#VEN_1AF4&DEV_1110&SUBSYS_11001AF4&REV_01#3&11583659&0&88#{df576976-569d-4672-95a0-f57e4ea0b210}`
 
 Both producer and consumer must use the exact same `shm-path` value.
+For `ivshmem://`, the backend is attach-only (reader/open side): use when a host-side daemon already owns and feeds the shared region.
 
 ## Run Transport Smoke Test
 
@@ -146,4 +150,4 @@ Notes:
 
 - `shm2src` currently requires producer/SHM region to exist when source starts.
 - No full stress/fault-recovery automated CI matrix yet.
-- ivshmem/BAR backend is not implemented yet.
+- ivshmem backend currently targets Windows guest attach/open path; sink/create path is intentionally unsupported.

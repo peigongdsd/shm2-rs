@@ -4,6 +4,8 @@ use std::ptr::NonNull;
 #[cfg(unix)]
 pub mod posix_file;
 #[cfg(windows)]
+pub mod windows_ivshmem;
+#[cfg(windows)]
 pub mod windows_named;
 
 #[derive(Debug)]
@@ -149,6 +151,27 @@ fn resolve_with_scheme(scheme: &str, raw_name: &str) -> Result<BackendSelection,
                 let _ = raw_name;
                 return Err(ShmError::UnsupportedBackend(
                     "winshm:// is only available on windows targets",
+                ));
+            }
+        }
+        "ivshmem" => {
+            #[cfg(windows)]
+            {
+                if raw_name.is_empty() {
+                    return Err(ShmError::InvalidBackendSpec(
+                        "ivshmem:// URI requires a device target".to_string(),
+                    ));
+                }
+                return Ok(BackendSelection {
+                    backend: Box::new(windows_ivshmem::WindowsIvshmemBackend),
+                    name: raw_name.to_string(),
+                });
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = raw_name;
+                return Err(ShmError::UnsupportedBackend(
+                    "ivshmem:// is only available on windows targets",
                 ));
             }
         }
