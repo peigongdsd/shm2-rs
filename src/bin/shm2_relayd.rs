@@ -48,7 +48,39 @@ fn parse_listen(spec: &str) -> Result<ListenSpec, String> {
 }
 
 fn normalize_pipeline(input: &str) -> String {
-    input.replace("\\!", "!")
+    let mut normalized = input.replace("\\!", "!");
+    normalized = normalize_caps_filters(&normalized);
+    normalized
+}
+
+fn normalize_caps_filters(input: &str) -> String {
+    // Accept gst-launch-style caps tokens after '!' and rewrite to capsfilter
+    // so gst_parse_launch doesn't misinterpret them as element names.
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    if tokens.is_empty() {
+        return input.to_string();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "!" && i + 1 < tokens.len() {
+            let next = tokens[i + 1];
+            let is_caps = next.starts_with("video/")
+                || next.starts_with("audio/")
+                || next.starts_with("text/")
+                || next.starts_with("application/");
+            if is_caps {
+                out.push("!".to_string());
+                out.push("capsfilter".to_string());
+                out.push(format!("caps={}", next));
+                i += 2;
+                continue;
+            }
+        }
+        out.push(tokens[i].to_string());
+        i += 1;
+    }
+    out.join(" ")
 }
 
 fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>), String> {
