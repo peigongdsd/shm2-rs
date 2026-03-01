@@ -548,6 +548,14 @@ impl Writer {
         self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
         true
     }
+
+    pub fn bump_startup_seq(&self, generation: u64) -> bool {
+        if self.hdr.startup_gen.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
+        true
+    }
 }
 
 impl Reader {
@@ -796,6 +804,14 @@ impl Reader {
             return false;
         }
         self.hdr.startup_state.store(state, Ordering::Release);
+        self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    pub fn bump_startup_seq(&self, generation: u64) -> bool {
+        if self.hdr.startup_gen.load(Ordering::Acquire) != generation {
+            return false;
+        }
         self.hdr.startup_seq.fetch_add(1, Ordering::AcqRel);
         true
     }
