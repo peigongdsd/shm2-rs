@@ -364,7 +364,7 @@ mod imp {
             };
 
             let mut idle_cycles = 0u32;
-            let (desc, ptr, snap) = loop {
+            let (desc, ptr, snap, dropped) = loop {
                 {
                     let state = self.state.lock().expect("state poisoned");
                     if state.unlocked {
@@ -372,11 +372,11 @@ mod imp {
                     }
                 }
                 let mut r = reader.lock().map_err(|_| gst::FlowError::Error)?;
-                match r.try_recv_desc().map_err(|_| gst::FlowError::Error)? {
-                    Some(desc) => {
+                match r.try_recv_latest_desc().map_err(|_| gst::FlowError::Error)? {
+                    Some((desc, dropped)) => {
                         let ptr = r.payload_ptr(&desc).map_err(|_| gst::FlowError::Error)?;
                         let snap = r.timeline_snapshot();
-                        break (desc, ptr, snap);
+                        break (desc, ptr, snap, dropped);
                     }
                     None => {
                         drop(r);
@@ -431,10 +431,20 @@ mod imp {
                             buf.set_flags(gst::BufferFlags::DISCONT);
                         }
                     }
+                    if dropped > 0 {
+                        if let Some(now) = now_rt {
+                            ts.in_base_pts_ns = Some(desc.pts_ns.max(0));
+                            ts.out_base_running_ns = Some(now);
+                            buf.set_flags(gst::BufferFlags::DISCONT);
+                            out_pts_ns = now as i64;
+                        }
+                    }
                     if let (Some(in_base), Some(out_base)) =
                         (ts.in_base_pts_ns, ts.out_base_running_ns)
                     {
-                        out_pts_ns = rebase_pts_ns(desc.pts_ns, in_base, out_base);
+                        if out_pts_ns < 0 {
+                            out_pts_ns = rebase_pts_ns(desc.pts_ns, in_base, out_base);
+                        }
                     }
 
                     if out_pts_ns >= 0 {

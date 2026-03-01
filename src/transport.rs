@@ -265,19 +265,8 @@ impl Writer {
     pub fn publish(&mut self, payload: &[u8], pts_ns: i64) -> Result<u32, ShmError> {
         let lease = self.alloc_lease(payload.len() as u32, self.allocator_align)?;
         unsafe {
-            let arena_start = self.arena as usize;
-            let arena_end = arena_start + (self.hdr.arena_size as usize);
-            let src = payload.as_ptr() as usize;
-            let src_end = src + payload.len();
-            let dst = lease.ptr as usize;
-            let dst_end = dst + payload.len();
-            let in_arena = src >= arena_start && src_end <= arena_end;
-            let overlap = src < dst_end && dst < src_end;
-            if in_arena && overlap {
-                std::ptr::copy(payload.as_ptr(), lease.ptr, payload.len());
-            } else {
-                std::ptr::copy_nonoverlapping(payload.as_ptr(), lease.ptr, payload.len());
-            }
+            // Always use overlap-safe copy: upstream buffers can reference SHM arena memory.
+            std::ptr::copy(payload.as_ptr(), lease.ptr, payload.len());
         }
         if let Err(err) = self.publish_lease(lease, pts_ns) {
             let _ = self.free_lease(lease.buffer_id);
@@ -288,17 +277,24 @@ impl Writer {
 
     pub fn alloc_lease(&mut self, size: u32, align: u64) -> Result<AllocLease, ShmError> {
         self.drain_recycles();
-        let alloc = self.allocator.alloc(size, align).ok_or_else(|| {
-            self.hdr.alloc_failures.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "[shm2] allocator exhausted: used_bytes={} arena_size={} size={} align={}",
-                self.allocator.used_bytes(),
-                self.hdr.arena_size,
-                size,
-                align
-            );
-            ShmError::Exhausted
-        })?;
+        let alloc = loop {
+            if let Some(alloc) = self.allocator.alloc(size, align) {
+                break alloc;
+            }
+            eprintln!("[shm2] allocator full, dropping oldest ready buffer");
+            // Drop the oldest queued buffer to make room.
+            if !self.drop_oldest_ready() {
+                self.hdr.alloc_failures.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[shm2] allocator exhausted: used_bytes={} arena_size={} size={} align={}",
+                    self.allocator.used_bytes(),
+                    self.hdr.arena_size,
+                    size,
+                    align
+                );
+                return Err(ShmError::Exhausted);
+            }
+        };
         let ptr = unsafe { self.arena.add(alloc.offset as usize) };
         Ok(AllocLease {
             buffer_id: alloc.buffer_id,
@@ -369,6 +365,23 @@ impl Writer {
         self.touch_producer_heartbeat();
     }
 
+    fn drop_oldest_ready(&mut self) -> bool {
+        let cap = u64::from(self.hdr.ready_capacity);
+        let head = self.hdr.ready_head.load(Ordering::Acquire);
+        let tail = self.hdr.ready_tail.load(Ordering::Relaxed);
+        if head == tail {
+            return false;
+        }
+        let idx = (tail % cap) as usize;
+        let desc = self.ready[idx];
+        let _ = self.allocator.free_by_id(desc.buffer_id);
+        self.hdr.ready_tail.store(tail + 1, Ordering::Release);
+        self.hdr
+            .arena_used_bytes
+            .store(self.allocator.used_bytes(), Ordering::Relaxed);
+        true
+    }
+
     pub fn set_running(&self) {
         self.hdr.state.store(STATE_RUNNING, Ordering::Release);
     }
@@ -432,6 +445,8 @@ impl Writer {
         self.hdr.arena_used_bytes.store(0, Ordering::Relaxed);
         self.hdr.arena_high_watermark.store(0, Ordering::Relaxed);
         self.hdr.alloc_failures.store(0, Ordering::Relaxed);
+        self.hdr.timeline_gen.fetch_add(1, Ordering::AcqRel);
+        self.hdr.timeline_valid.store(0, Ordering::Release);
     }
 
     fn maybe_publish_timeline_snapshot(&mut self, producer_pts_ns: i64, ready_head: u64) {
@@ -558,6 +573,48 @@ impl Reader {
         Ok(Some(out))
     }
 
+    pub fn try_recv_latest_desc(&mut self) -> Result<Option<(ReceivedDesc, u64)>, ShmError> {
+        let cap = u64::from(self.hdr.ready_capacity);
+        let head = self.hdr.ready_head.load(Ordering::Acquire);
+        let tail = self.hdr.ready_tail.load(Ordering::Relaxed);
+        if head == tail {
+            self.touch_consumer_heartbeat();
+            return Ok(None);
+        }
+
+        let dropped = head.saturating_sub(tail + 1);
+        let newest_idx = ((head - 1) % cap) as usize;
+        let newest = self.ready[newest_idx];
+        let out = ReceivedDesc {
+            seq: newest.seq,
+            buffer_id: newest.buffer_id,
+            pts_ns: newest.pts_ns,
+            dts_ns: newest.dts_ns,
+            duration_ns: newest.duration_ns,
+            flags: newest.flags,
+            offset: newest.offset,
+            len: newest.length,
+        };
+
+        self.validate_bounds(out.offset, out.len as usize)?;
+
+        // Recycle older queued entries (tail..head-1).
+        let mut cur = tail;
+        while cur + 1 < head {
+            let idx = (cur % cap) as usize;
+            let desc = self.ready[idx];
+            if !self.try_recycle_desc(desc.buffer_id, desc.offset, desc.length, 1) {
+                break;
+            }
+            cur += 1;
+        }
+
+        // Consume all queued entries including the newest one we return.
+        self.hdr.ready_tail.store(head, Ordering::Release);
+        self.touch_consumer_heartbeat();
+        Ok(Some((out, dropped)))
+    }
+
     pub fn payload_ptr(&self, desc: &ReceivedDesc) -> Result<*const u8, ShmError> {
         self.validate_bounds(desc.offset, desc.len as usize)?;
         let ptr = unsafe { self.arena.add(desc.offset as usize) };
@@ -601,6 +658,33 @@ impl Reader {
             }
             poll_yield_sleep(&mut idle_cycles, Duration::from_millis(1));
         }
+    }
+
+    fn try_recycle_desc(
+        &mut self,
+        buffer_id: u32,
+        offset: u64,
+        length: u32,
+        status: u32,
+    ) -> bool {
+        let cap = u64::from(self.hdr.rec_capacity);
+        let head = self.hdr.rec_head.load(Ordering::Relaxed);
+        let tail = self.hdr.rec_tail.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) >= cap {
+            return false;
+        }
+        let idx = (head % cap) as usize;
+        self.recycle[idx] = RecycleDesc {
+            seq: head + 1,
+            buffer_id,
+            status,
+            offset,
+            length,
+            reserved: [0u8; 36],
+        };
+        self.hdr.rec_head.store(head + 1, Ordering::Release);
+        self.touch_consumer_heartbeat();
+        true
     }
 
     pub fn timeline_snapshot(&self) -> TimelineSnapshot {
