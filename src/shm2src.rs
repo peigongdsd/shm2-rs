@@ -13,7 +13,7 @@ use gstreamer_base as gst_base;
 use once_cell::sync::Lazy;
 
 use crate::platform::resolve_backend;
-use crate::transport::{Reader, ReceivedDesc};
+use crate::transport::{Reader, ReceivedDesc, TimelineSnapshot};
 
 type ReaderType = Reader;
 
@@ -39,11 +39,13 @@ impl Default for Settings {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct TimelineState {
     need_reset: bool,
     in_base_pts_ns: Option<i64>,
     out_base_running_ns: Option<u64>,
+    last_sync_seq: u64,
+    expected_sync_gen: u64,
 }
 
 #[derive(Default)]
@@ -106,6 +108,32 @@ fn rebase_pts_ns(desc_pts_ns: i64, in_base_pts_ns: i64, out_base_running_ns: u64
     out_base_running_ns
         .saturating_add(clamped_delta)
         .min(i64::MAX as u64) as i64
+}
+
+fn apply_timeline_snapshot(ts: &mut TimelineState, snap: TimelineSnapshot, out_now_ns: u64) {
+    if !snap.valid || snap.producer_pts_ns < 0 {
+        return;
+    }
+
+    let in_base = ts.in_base_pts_ns.unwrap_or(snap.producer_pts_ns.max(0));
+    let desired_out_base = out_now_ns.saturating_sub(snap.producer_pts_ns.max(0) as u64);
+
+    match ts.out_base_running_ns {
+        None => {
+            ts.in_base_pts_ns = Some(in_base);
+            ts.out_base_running_ns = Some(desired_out_base);
+        }
+        Some(cur_out_base) => {
+            // Slew-limit correction to avoid visible jumps (2ms per beacon step).
+            let err = (desired_out_base as i128) - (cur_out_base as i128);
+            let step = err.clamp(-2_000_000, 2_000_000);
+            let new_base = ((cur_out_base as i128) + step).max(0) as u64;
+            ts.in_base_pts_ns = Some(in_base);
+            ts.out_base_running_ns = Some(new_base);
+        }
+    }
+
+    ts.last_sync_seq = snap.seq;
 }
 
 mod imp {
@@ -196,7 +224,6 @@ mod imp {
                     "shm2-rs",
                 )
             });
-
             Some(&*METADATA)
         }
 
@@ -213,7 +240,6 @@ mod imp {
                     .expect("failed to create src pad template"),
                 ]
             });
-
             PAD_TEMPLATES.as_ref()
         }
     }
@@ -248,12 +274,15 @@ mod imp {
                     ]
                 )
             })?;
+            let snap = reader.timeline_snapshot();
             self.obj().set_live(state.settings.is_live);
             state.reader = Some(Arc::new(Mutex::new(reader)));
             state.unlocked = false;
             state.timeline.need_reset = true;
             state.timeline.in_base_pts_ns = None;
             state.timeline.out_base_running_ns = None;
+            state.timeline.last_sync_seq = 0;
+            state.timeline.expected_sync_gen = snap.generation;
             Ok(())
         }
 
@@ -269,6 +298,8 @@ mod imp {
             state.timeline.need_reset = true;
             state.timeline.in_base_pts_ns = None;
             state.timeline.out_base_running_ns = None;
+            state.timeline.last_sync_seq = 0;
+            state.timeline.expected_sync_gen = 0;
             Ok(())
         }
 
@@ -307,7 +338,7 @@ mod imp {
             };
 
             let mut idle_cycles = 0u32;
-            let (desc, ptr) = loop {
+            let (desc, ptr, snap) = loop {
                 {
                     let state = self.state.lock().expect("state poisoned");
                     if state.unlocked {
@@ -318,7 +349,8 @@ mod imp {
                 match r.try_recv_desc().map_err(|_| gst::FlowError::Error)? {
                     Some(desc) => {
                         let ptr = r.payload_ptr(&desc).map_err(|_| gst::FlowError::Error)?;
-                        break (desc, ptr);
+                        let snap = r.timeline_snapshot();
+                        break (desc, ptr, snap);
                     }
                     None => {
                         drop(r);
@@ -335,45 +367,60 @@ mod imp {
             };
             let mem = gst::Memory::from_slice(wrap);
             let mut out = gst::Buffer::new();
+
             if let Some(buf) = out.get_mut() {
-                let (live_only, mut need_reset, mut in_base_pts_ns, mut out_base_running_ns) = {
+                let now_rt = current_running_time_ns(&self.obj());
+                let (live_only, mut ts) = {
                     let state = self.state.lock().expect("state poisoned");
-                    (
-                        state.settings.live_only,
-                        state.timeline.need_reset,
-                        state.timeline.in_base_pts_ns,
-                        state.timeline.out_base_running_ns,
-                    )
+                    (state.settings.live_only, TimelineState { ..state.timeline })
                 };
 
-                let mut out_pts_ns = desc.pts_ns;
+                if snap.generation != ts.expected_sync_gen {
+                    ts.expected_sync_gen = snap.generation;
+                    ts.need_reset = true;
+                    ts.in_base_pts_ns = None;
+                    ts.out_base_running_ns = None;
+                    ts.last_sync_seq = 0;
+                }
+
                 if live_only {
-                    if need_reset {
-                        // Only arm the re-timestamp anchor once src has a valid running-time
-                        // clock. Falling back to producer PTS here can place frames far in the
-                        // future and cause long visible freezes with sync=true sinks.
-                        if let Some(rt_now) = current_running_time_ns(&self.obj()) {
-                            in_base_pts_ns = Some(desc.pts_ns.max(0));
-                            out_base_running_ns = Some(rt_now);
-                            need_reset = false;
+                    if let Some(now) = now_rt {
+                        if snap.valid
+                            && snap.snapshot_gen == ts.expected_sync_gen
+                            && snap.seq != ts.last_sync_seq
+                        {
+                            apply_timeline_snapshot(&mut ts, snap, now);
+                        }
+                    }
+
+                    let mut out_pts_ns = desc.pts_ns;
+                    if ts.need_reset {
+                        if let Some(now) = now_rt {
+                            ts.in_base_pts_ns = Some(desc.pts_ns.max(0));
+                            ts.out_base_running_ns = Some(now);
+                            ts.need_reset = false;
                             buf.set_flags(gst::BufferFlags::DISCONT);
                         }
                     }
-                    if let (Some(in_base), Some(out_base)) = (in_base_pts_ns, out_base_running_ns) {
+                    if let (Some(in_base), Some(out_base)) =
+                        (ts.in_base_pts_ns, ts.out_base_running_ns)
+                    {
                         out_pts_ns = rebase_pts_ns(desc.pts_ns, in_base, out_base);
                     }
 
+                    if out_pts_ns >= 0 {
+                        buf.set_pts(gst::ClockTime::from_nseconds(out_pts_ns as u64));
+                    }
+
                     let mut state = self.state.lock().expect("state poisoned");
-                    state.timeline.need_reset = need_reset;
-                    state.timeline.in_base_pts_ns = in_base_pts_ns;
-                    state.timeline.out_base_running_ns = out_base_running_ns;
+                    state.timeline = ts;
+                } else if desc.pts_ns >= 0 {
+                    buf.set_pts(gst::ClockTime::from_nseconds(desc.pts_ns as u64));
                 }
 
-                if out_pts_ns >= 0 {
-                    buf.set_pts(gst::ClockTime::from_nseconds(out_pts_ns as u64));
-                }
                 buf.append_memory(mem);
             }
+
             Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(out))
         }
     }

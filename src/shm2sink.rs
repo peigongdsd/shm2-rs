@@ -29,6 +29,7 @@ struct Settings {
     perms: u32,
     wait_for_connection: bool,
     consumer_timeout_ms: u32,
+    timeline_beacon_ms: u32,
 }
 
 impl Default for Settings {
@@ -39,6 +40,7 @@ impl Default for Settings {
             perms: 0o660,
             wait_for_connection: true,
             consumer_timeout_ms: 1000,
+            timeline_beacon_ms: 250,
         }
     }
 }
@@ -270,6 +272,14 @@ mod imp {
                         .maximum(60_000)
                         .mutable_ready()
                         .build(),
+                    glib::ParamSpecUInt::builder("timeline-beacon-ms")
+                        .nick("Timeline beacon")
+                        .blurb("Timeline synchronization beacon period in milliseconds")
+                        .default_value(250)
+                        .minimum(1)
+                        .maximum(60_000)
+                        .mutable_ready()
+                        .build(),
                 ]
             });
             PROPERTIES.as_ref()
@@ -303,6 +313,11 @@ mod imp {
                         state.settings.consumer_timeout_ms = v;
                     }
                 }
+                "timeline-beacon-ms" => {
+                    if let Ok(v) = value.get::<u32>() {
+                        state.settings.timeline_beacon_ms = v.max(1);
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -315,6 +330,7 @@ mod imp {
                 "perms" => state.settings.perms.to_value(),
                 "wait-for-connection" => state.settings.wait_for_connection.to_value(),
                 "consumer-timeout-ms" => state.settings.consumer_timeout_ms.to_value(),
+                "timeline-beacon-ms" => state.settings.timeline_beacon_ms.to_value(),
                 _ => unreachable!(),
             }
         }
@@ -359,6 +375,7 @@ mod imp {
             let cfg = TransportConfig {
                 total_size: state.settings.shm_size as usize,
                 perms: state.settings.perms,
+                timeline_beacon_ms: state.settings.timeline_beacon_ms,
                 ..Default::default()
             };
 

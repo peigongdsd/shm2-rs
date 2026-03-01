@@ -106,6 +106,15 @@ pub struct SharedHeader {
     pub wait_for_connection: AtomicU32,
     pub drop_when_no_consumer: AtomicU32,
     pub notify_mode: AtomicU32,
+
+    // Cross-endpoint timeline synchronization snapshot (SHM-only control plane).
+    pub timeline_gen: AtomicU64,
+    pub timeline_snapshot_gen: AtomicU64,
+    pub timeline_valid: AtomicU32,
+    pub timeline_seq: AtomicU64,
+    pub timeline_sink_mono_ns: AtomicU64,
+    pub timeline_producer_pts_ns: AtomicU64,
+    pub timeline_ready_head: AtomicU64,
 }
 
 pub struct TransportConfig {
@@ -116,6 +125,7 @@ pub struct TransportConfig {
     pub wait_for_connection: bool,
     pub drop_when_no_consumer: bool,
     pub allocator_align: u64,
+    pub timeline_beacon_ms: u32,
 }
 
 impl Default for TransportConfig {
@@ -128,6 +138,7 @@ impl Default for TransportConfig {
             wait_for_connection: true,
             drop_when_no_consumer: false,
             allocator_align: 64,
+            timeline_beacon_ms: 250,
         }
     }
 }
@@ -140,6 +151,9 @@ pub struct Writer {
     arena: *mut u8,
     allocator: FreeListAllocator,
     allocator_align: u64,
+    timeline_beacon_ns: u64,
+    last_timeline_emit_ns: u64,
+    last_timeline_snapshot_gen: u64,
 }
 
 pub struct Reader {
@@ -148,6 +162,17 @@ pub struct Reader {
     ready: &'static mut [ReadyDesc],
     recycle: &'static mut [RecycleDesc],
     arena: *mut u8,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TimelineSnapshot {
+    pub generation: u64,
+    pub snapshot_gen: u64,
+    pub valid: bool,
+    pub seq: u64,
+    pub sink_mono_ns: u64,
+    pub producer_pts_ns: i64,
+    pub ready_head: u64,
 }
 
 // Writer/Reader are guarded externally by element mutexes.
@@ -231,6 +256,9 @@ impl Writer {
             arena: arena_ptr,
             allocator: FreeListAllocator::new(arena_size),
             allocator_align: cfg.allocator_align,
+            timeline_beacon_ns: (cfg.timeline_beacon_ms.max(1) as u64) * 1_000_000,
+            last_timeline_emit_ns: 0,
+            last_timeline_snapshot_gen: 0,
         })
     }
 
@@ -295,6 +323,7 @@ impl Writer {
                 self.hdr.ready_head.store(head + 1, Ordering::Release);
                 self.touch_producer_heartbeat();
                 self.update_usage_metrics();
+                self.maybe_publish_timeline_snapshot(pts_ns, head + 1);
                 return Ok(());
             }
             self.drain_recycles();
@@ -367,6 +396,33 @@ impl Writer {
                 Err(v) => prev_hw = v,
             }
         }
+    }
+
+    fn maybe_publish_timeline_snapshot(&mut self, producer_pts_ns: i64, ready_head: u64) {
+        let now = now_nanos();
+        let generation = self.hdr.timeline_gen.load(Ordering::Acquire);
+        let generation_changed = generation != self.last_timeline_snapshot_gen;
+        let periodic_due =
+            now.saturating_sub(self.last_timeline_emit_ns) >= self.timeline_beacon_ns;
+        if !generation_changed && !periodic_due {
+            return;
+        }
+
+        self.hdr.timeline_sink_mono_ns.store(now, Ordering::Relaxed);
+        self.hdr
+            .timeline_producer_pts_ns
+            .store(producer_pts_ns.max(0) as u64, Ordering::Relaxed);
+        self.hdr
+            .timeline_ready_head
+            .store(ready_head, Ordering::Relaxed);
+        self.hdr
+            .timeline_snapshot_gen
+            .store(generation, Ordering::Relaxed);
+        self.hdr.timeline_seq.fetch_add(1, Ordering::AcqRel);
+        self.hdr.timeline_valid.store(1, Ordering::Release);
+
+        self.last_timeline_emit_ns = now;
+        self.last_timeline_snapshot_gen = generation;
     }
 }
 
@@ -511,6 +567,19 @@ impl Reader {
         }
     }
 
+    pub fn timeline_snapshot(&self) -> TimelineSnapshot {
+        let valid = self.hdr.timeline_valid.load(Ordering::Acquire) != 0;
+        TimelineSnapshot {
+            generation: self.hdr.timeline_gen.load(Ordering::Acquire),
+            snapshot_gen: self.hdr.timeline_snapshot_gen.load(Ordering::Acquire),
+            valid,
+            seq: self.hdr.timeline_seq.load(Ordering::Acquire),
+            sink_mono_ns: self.hdr.timeline_sink_mono_ns.load(Ordering::Acquire),
+            producer_pts_ns: self.hdr.timeline_producer_pts_ns.load(Ordering::Acquire) as i64,
+            ready_head: self.hdr.timeline_ready_head.load(Ordering::Acquire),
+        }
+    }
+
     fn touch_consumer_heartbeat(&self) {
         self.hdr
             .consumer_heartbeat_ns
@@ -531,11 +600,15 @@ impl Reader {
             Ordering::Acquire,
         ) {
             Ok(_) => {
+                self.hdr.timeline_gen.fetch_add(1, Ordering::AcqRel);
+                self.hdr.timeline_valid.store(0, Ordering::Release);
                 resync_to_latest();
                 self.touch_consumer_heartbeat();
                 Ok(())
             }
             Err(current) if current == pid => {
+                self.hdr.timeline_gen.fetch_add(1, Ordering::AcqRel);
+                self.hdr.timeline_valid.store(0, Ordering::Release);
                 resync_to_latest();
                 self.touch_consumer_heartbeat();
                 Ok(())
@@ -665,6 +738,13 @@ fn init_header(
     hdr.drop_when_no_consumer
         .store(drop_when_no_consumer as u32, Ordering::Relaxed);
     hdr.notify_mode.store(0, Ordering::Relaxed);
+    hdr.timeline_gen.store(0, Ordering::Relaxed);
+    hdr.timeline_snapshot_gen.store(0, Ordering::Relaxed);
+    hdr.timeline_valid.store(0, Ordering::Relaxed);
+    hdr.timeline_seq.store(0, Ordering::Relaxed);
+    hdr.timeline_sink_mono_ns.store(0, Ordering::Relaxed);
+    hdr.timeline_producer_pts_ns.store(0, Ordering::Relaxed);
+    hdr.timeline_ready_head.store(0, Ordering::Relaxed);
     hdr.state.store(STATE_RUNNING, Ordering::Release);
 }
 
