@@ -269,6 +269,11 @@ fn run_tcp_listener(
                 continue;
             }
         };
+        let peer = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        println!("[shm2_relayd] client connected {peer}");
         let current = count.fetch_add(1, Ordering::SeqCst) + 1;
         notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
 
@@ -277,21 +282,47 @@ fn run_tcp_listener(
         let splash_pipeline = splash_pipeline.clone();
         let count_clone = count.clone();
         thread::spawn(move || {
-            let _ = hold_connection(stream);
+            let _ = hold_connection(stream, &peer);
             let current = count_clone.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
             notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
+            println!("[shm2_relayd] client disconnected {peer}");
         });
     }
 
     Ok(())
 }
 
-fn hold_connection(mut stream: std::net::TcpStream) -> io::Result<()> {
+fn hold_connection(mut stream: std::net::TcpStream, peer: &str) -> io::Result<()> {
     let mut buf = [0u8; 1024];
+    let mut pending = Vec::with_capacity(1024);
     loop {
         let n = stream.read(&mut buf)?;
         if n == 0 {
             break;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+            let line = pending.drain(..=pos).collect::<Vec<u8>>();
+            let msg = String::from_utf8_lossy(&line);
+            let msg = msg.trim_end_matches(['\r', '\n'].as_ref());
+            if !msg.is_empty() {
+                println!("[shm2_relayd] {peer}: {msg}");
+            }
+        }
+        if pending.len() >= 1024 {
+            let chunk = pending.drain(..).collect::<Vec<u8>>();
+            let msg = String::from_utf8_lossy(&chunk);
+            let msg = msg.trim_end_matches(['\r', '\n'].as_ref());
+            if !msg.is_empty() {
+                println!("[shm2_relayd] {peer}: {msg}");
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let msg = String::from_utf8_lossy(&pending);
+        let msg = msg.trim_end_matches(['\r', '\n'].as_ref());
+        if !msg.is_empty() {
+            println!("[shm2_relayd] {peer}: {msg}");
         }
     }
     Ok(())
@@ -346,6 +377,7 @@ fn run_vsock_listener(
             eprintln!("vsock accept error: {}", io::Error::last_os_error());
             continue;
         }
+        println!("[shm2_relayd] client connected vsock:{cid}:{port}");
         let current = count.fetch_add(1, Ordering::SeqCst) + 1;
         notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
 
@@ -354,16 +386,18 @@ fn run_vsock_listener(
         let splash_pipeline = splash_pipeline.clone();
         let count_clone = count.clone();
         thread::spawn(move || {
-            let _ = hold_vsock_connection(conn);
+            let _ = hold_vsock_connection(conn, cid, port);
             let current = count_clone.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
             notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
+            println!("[shm2_relayd] client disconnected vsock:{cid}:{port}");
         });
     }
 }
 
 #[cfg(target_os = "linux")]
-fn hold_vsock_connection(fd: RawFd) -> io::Result<()> {
+fn hold_vsock_connection(fd: RawFd, cid: u32, port: u32) -> io::Result<()> {
     let mut buf = [0u8; 1024];
+    let mut pending = Vec::with_capacity(1024);
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n == 0 {
@@ -373,6 +407,31 @@ fn hold_vsock_connection(fd: RawFd) -> io::Result<()> {
             let err = io::Error::last_os_error();
             unsafe { libc::close(fd) };
             return Err(err);
+        }
+        let n = n as usize;
+        pending.extend_from_slice(&buf[..n]);
+        while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+            let line = pending.drain(..=pos).collect::<Vec<u8>>();
+            let msg = String::from_utf8_lossy(&line);
+            let msg = msg.trim_end_matches(['\r', '\n'].as_ref());
+            if !msg.is_empty() {
+                println!("[shm2_relayd] vsock:{cid}:{port}: {msg}");
+            }
+        }
+        if pending.len() >= 1024 {
+            let chunk = pending.drain(..).collect::<Vec<u8>>();
+            let msg = String::from_utf8_lossy(&chunk);
+            let msg = msg.trim_end_matches(['\r', '\n'].as_ref());
+            if !msg.is_empty() {
+                println!("[shm2_relayd] vsock:{cid}:{port}: {msg}");
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let msg = String::from_utf8_lossy(&pending);
+        let msg = msg.trim_end_matches(['\r', '\n'].as_ref());
+        if !msg.is_empty() {
+            println!("[shm2_relayd] vsock:{cid}:{port}: {msg}");
         }
     }
     unsafe { libc::close(fd) };
