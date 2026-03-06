@@ -83,12 +83,13 @@ fn normalize_caps_filters(input: &str) -> String {
     out.join(" ")
 }
 
-fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>), String> {
+fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool), String> {
     let mut listen = "tcp://0.0.0.0:5555".to_string();
     let mut shm_path: Option<String> = None;
     let mut shm_size: u64 = 64 * 1024 * 1024;
     let mut input: Option<String> = None;
     let mut splash: Option<String> = None;
+    let mut deep_copy = true;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -113,6 +114,9 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>), Str
             "--splash" => {
                 splash = Some(args.next().ok_or("--splash requires a pipeline string")?);
             }
+            "--no-deep-copy" => {
+                deep_copy = false;
+            }
             "--help" | "-h" => {
                 return Err("help".to_string());
             }
@@ -130,12 +134,13 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>), Str
         shm_size,
         normalize_pipeline(&input),
         splash.map(|p| normalize_pipeline(&p)),
+        deep_copy,
     ))
 }
 
 fn usage() {
     eprintln!(
-        "Usage: shm2_relayd --shm-path <path> [--shm-size <bytes>] --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT]"
+        "Usage: shm2_relayd --shm-path <path> [--shm-size <bytes>] --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT] [--no-deep-copy]"
     );
 }
 
@@ -183,6 +188,7 @@ fn backend_pipeline_create(
     pipeline_str: &str,
     appsrc: &gst_app::AppSrc,
     base_time: Option<gst::ClockTime>,
+    deep_copy: bool,
 ) -> Result<gst::Pipeline, gst::glib::Error> {
     let element = gst::parse::launch(pipeline_str)?;
     let pipeline = match element.clone().downcast::<gst::Pipeline>() {
@@ -219,11 +225,15 @@ fn backend_pipeline_create(
                     caps_set_cb.store(true, Ordering::Relaxed);
                 }
             }
-            let buffer = sample
-                .buffer()
-                .ok_or(gst::FlowError::Error)?
-                .copy_deep()
-                .map_err(|_| gst::FlowError::Error)?;
+            let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+            let buffer = if deep_copy {
+                buffer.copy_deep().map_err(|_| gst::FlowError::Error)?
+            } else {
+                // Shallow copy: keep GstMemory refs without duplicating payloads.
+                buffer
+                    .copy_region(gst::BUFFER_COPY_ALL, ..)
+                    .map_err(|_| gst::FlowError::Error)?
+            };
             appsrc.push_buffer(buffer).map_err(|_| gst::FlowError::Error)?;
             Ok(gst::FlowSuccess::Ok)
         })
@@ -466,7 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(Box::new(err));
     }
 
-    let (listen, shm_path, shm_size, input, splash) = match parse_args() {
+    let (listen, shm_path, shm_size, input, splash, deep_copy) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             if e == "help" {
@@ -482,9 +492,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (output_pipeline, appsrc) = output_pipeline_create(&shm_path, shm_size)?;
     let base_time = output_pipeline.base_time();
 
-    let input_pipeline = backend_pipeline_create("input-pipeline", &input, &appsrc, base_time)?;
+    let input_pipeline =
+        backend_pipeline_create("input-pipeline", &input, &appsrc, base_time, deep_copy)?;
     let splash_pipeline = if let Some(p) = splash.as_deref() {
-        Some(backend_pipeline_create("splash-pipeline", p, &appsrc, base_time)?)
+        Some(backend_pipeline_create(
+            "splash-pipeline",
+            p,
+            &appsrc,
+            base_time,
+            deep_copy,
+        )?)
     } else {
         None
     };
