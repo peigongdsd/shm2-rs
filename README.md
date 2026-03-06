@@ -122,7 +122,7 @@ Notes:
 - For Linux vsock: `--listen vsock://CID:PORT`.
 - Appsrc queue controls (optional): `--appsrc-max-buffers <n>`, `--appsrc-max-bytes <n>`, `--appsrc-max-time <ns>`,
   `--appsrc-block|--appsrc-no-block`, `--appsrc-leaky none|upstream|downstream`. Defaults: max-buffers=8, max-bytes=0,
-  max-time=0, block=true, leaky=none.
+  max-time=0, block=false, leaky=downstream.
 - Use `--no-deep-copy` to avoid payload duplication (shallow buffer copy only).
 
 ## Plugin Discovery
