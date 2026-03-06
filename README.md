@@ -120,6 +120,10 @@ Notes:
 - Output pipeline is always PLAYING; input pipeline toggles on client connect/disconnect.
 - `--shm-path` is the only output-side knob.
 - For Linux vsock: `--listen vsock://CID:PORT`.
+- Appsrc queue controls (optional): `--appsrc-max-buffers <n>`, `--appsrc-max-bytes <n>`, `--appsrc-max-time <ns>`,
+  `--appsrc-block|--appsrc-no-block`, `--appsrc-leaky none|upstream|downstream`. Defaults: max-buffers=8, max-bytes=0,
+  max-time=0, block=true, leaky=none.
+- Use `--no-deep-copy` to avoid payload duplication (shallow buffer copy only).
 
 ## Plugin Discovery
 
