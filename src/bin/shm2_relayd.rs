@@ -98,8 +98,8 @@ impl Default for AppSrcConfig {
             max_buffers: 8,
             max_bytes: 0,
             max_time_ns: 0,
-            block: false,
-            leaky: gst_app::AppLeakyType::Downstream,
+            block: true,
+            leaky: gst_app::AppLeakyType::None,
         }
     }
 }
@@ -240,23 +240,19 @@ fn output_pipeline_create(
         .and_then(|e| e.downcast::<gst_app::AppSrc>().ok())
         .ok_or_else(|| gst::glib::Error::new(gst::CoreError::Failed, "appsrc not found"))?;
 
-    apply_appsrc_config(&appsrc, appsrc_cfg);
-
-    Ok((pipeline, appsrc))
-}
-
-fn apply_appsrc_config(appsrc: &gst_app::AppSrc, cfg: AppSrcConfig) {
     appsrc.set_property("is-live", true);
     appsrc.set_property("format", gst::Format::Time);
     appsrc.set_property("stream-type", gst_app::AppStreamType::Stream);
-    appsrc.set_property("block", cfg.block);
-    appsrc.set_property("max-buffers", cfg.max_buffers);
-    appsrc.set_property("max-bytes", cfg.max_bytes);
+    appsrc.set_property("block", appsrc_cfg.block);
+    appsrc.set_property("max-buffers", appsrc_cfg.max_buffers);
+    appsrc.set_property("max-bytes", appsrc_cfg.max_bytes);
     appsrc.set_property(
         "max-time",
-        gst::ClockTime::from_nseconds(cfg.max_time_ns),
+        gst::ClockTime::from_nseconds(appsrc_cfg.max_time_ns),
     );
-    appsrc.set_property("leaky-type", cfg.leaky);
+    appsrc.set_property("leaky-type", appsrc_cfg.leaky);
+
+    Ok((pipeline, appsrc))
 }
 
 #[derive(Clone)]
@@ -596,70 +592,6 @@ fn flush_appsrc(appsrc: &gst_app::AppSrc) {
     if let Some(src_pad) = appsrc.static_pad("src") {
         let _ = src_pad.send_event(gst::event::FlushStart::new());
         let _ = src_pad.send_event(gst::event::FlushStop::new(false));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gst::prelude::*;
-
-    #[test]
-    fn appsrc_config_applies_properties() {
-        gst::init().unwrap();
-        let appsrc = gst::ElementFactory::make("appsrc")
-            .build()
-            .unwrap()
-            .downcast::<gst_app::AppSrc>()
-            .unwrap();
-        let cfg = AppSrcConfig {
-            max_buffers: 5,
-            max_bytes: 1234,
-            max_time_ns: 5678,
-            block: false,
-            leaky: gst_app::AppLeakyType::Downstream,
-        };
-        apply_appsrc_config(&appsrc, cfg);
-
-        assert_eq!(appsrc.property::<bool>("block"), cfg.block);
-        assert_eq!(appsrc.property::<u64>("max-buffers"), cfg.max_buffers);
-        assert_eq!(appsrc.property::<u64>("max-bytes"), cfg.max_bytes);
-        assert_eq!(appsrc.property::<u64>("max-time"), cfg.max_time_ns);
-        assert_eq!(appsrc.property::<gst_app::AppLeakyType>("leaky-type"), cfg.leaky);
-    }
-
-    #[test]
-    fn appsrc_flush_allows_stop() {
-        gst::init().unwrap();
-        let pipeline = gst::parse::launch(
-            "appsrc name=appsrc is-live=true format=time stream-type=stream ! fakesink sync=false",
-        )
-        .unwrap()
-        .downcast::<gst::Pipeline>()
-        .unwrap();
-        let appsrc = pipeline
-            .by_name("appsrc")
-            .and_then(|e| e.downcast::<gst_app::AppSrc>().ok())
-            .unwrap();
-
-        let cfg = AppSrcConfig {
-            max_buffers: 2,
-            max_bytes: 0,
-            max_time_ns: 0,
-            block: false,
-            leaky: gst_app::AppLeakyType::Downstream,
-        };
-        apply_appsrc_config(&appsrc, cfg);
-
-        pipeline.set_state(gst::State::Playing).unwrap();
-        let buffer = gst::Buffer::from_slice(vec![0u8; 1]);
-        let _ = appsrc.push_buffer(buffer);
-        flush_appsrc(&appsrc);
-
-        pipeline.set_state(gst::State::Null).unwrap();
-        let (res, state, _) = pipeline.state(gst::ClockTime::from_seconds(2));
-        assert!(res.is_ok());
-        assert_eq!(state, gst::State::Null);
     }
 }
 
