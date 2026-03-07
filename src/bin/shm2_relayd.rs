@@ -89,7 +89,7 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool
     let mut shm_size: u64 = 64 * 1024 * 1024;
     let mut input: Option<String> = None;
     let mut splash: Option<String> = None;
-    let mut deep_copy = true;
+    let mut deep_copy = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -114,9 +114,6 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool
             "--splash" => {
                 splash = Some(args.next().ok_or("--splash requires a pipeline string")?);
             }
-            "--no-deep-copy" => {
-                deep_copy = false;
-            }
             "--help" | "-h" => {
                 return Err("help".to_string());
             }
@@ -140,7 +137,7 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool
 
 fn usage() {
     eprintln!(
-        "Usage: shm2_relayd --shm-path <path> [--shm-size <bytes>] --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT] [--no-deep-copy]"
+        "Usage: shm2_relayd --shm-path <path> [--shm-size <bytes>] --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT]"
     );
 }
 

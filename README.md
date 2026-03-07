@@ -120,6 +120,7 @@ Notes:
 - Output pipeline is always PLAYING; input pipeline toggles on client connect/disconnect.
 - `--shm-path` is the only output-side knob.
 - For Linux vsock: `--listen vsock://CID:PORT`.
+- Shallow buffer copy is the default (no payload duplication).
 
 ## Plugin Discovery
 
