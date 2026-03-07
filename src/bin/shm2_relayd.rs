@@ -83,35 +83,13 @@ fn normalize_caps_filters(input: &str) -> String {
     out.join(" ")
 }
 
-#[derive(Clone, Copy, Debug)]
-struct AppSrcConfig {
-    max_buffers: u64,
-    max_bytes: u64,
-    max_time_ns: u64,
-    block: bool,
-    leaky: gst_app::AppLeakyType,
-}
-
-impl Default for AppSrcConfig {
-    fn default() -> Self {
-        Self {
-            max_buffers: 8,
-            max_bytes: 0,
-            max_time_ns: 0,
-            block: true,
-            leaky: gst_app::AppLeakyType::None,
-        }
-    }
-}
-
-fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool, AppSrcConfig), String> {
+fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool), String> {
     let mut listen = "tcp://0.0.0.0:5555".to_string();
     let mut shm_path: Option<String> = None;
     let mut shm_size: u64 = 64 * 1024 * 1024;
     let mut input: Option<String> = None;
     let mut splash: Option<String> = None;
     let mut deep_copy = true;
-    let mut appsrc_cfg = AppSrcConfig::default();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -139,47 +117,6 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool
             "--no-deep-copy" => {
                 deep_copy = false;
             }
-            "--appsrc-max-buffers" => {
-                let value = args
-                    .next()
-                    .ok_or("--appsrc-max-buffers requires a value")?;
-                appsrc_cfg.max_buffers = value
-                    .parse::<u64>()
-                    .map_err(|_| "--appsrc-max-buffers must be a u64")?;
-            }
-            "--appsrc-max-bytes" => {
-                let value = args
-                    .next()
-                    .ok_or("--appsrc-max-bytes requires a value")?;
-                appsrc_cfg.max_bytes = value
-                    .parse::<u64>()
-                    .map_err(|_| "--appsrc-max-bytes must be a u64")?;
-            }
-            "--appsrc-max-time" => {
-                let value = args
-                    .next()
-                    .ok_or("--appsrc-max-time requires a value (ns)")?;
-                appsrc_cfg.max_time_ns = value
-                    .parse::<u64>()
-                    .map_err(|_| "--appsrc-max-time must be a u64 (ns)")?;
-            }
-            "--appsrc-block" => {
-                appsrc_cfg.block = true;
-            }
-            "--appsrc-no-block" => {
-                appsrc_cfg.block = false;
-            }
-            "--appsrc-leaky" => {
-                let value = args
-                    .next()
-                    .ok_or("--appsrc-leaky requires none|upstream|downstream")?;
-                appsrc_cfg.leaky = match value.as_str() {
-                    "none" => gst_app::AppLeakyType::None,
-                    "upstream" => gst_app::AppLeakyType::Upstream,
-                    "downstream" => gst_app::AppLeakyType::Downstream,
-                    _ => return Err("--appsrc-leaky must be none|upstream|downstream".to_string()),
-                };
-            }
             "--help" | "-h" => {
                 return Err("help".to_string());
             }
@@ -198,13 +135,12 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool
         normalize_pipeline(&input),
         splash.map(|p| normalize_pipeline(&p)),
         deep_copy,
-        appsrc_cfg,
     ))
 }
 
 fn usage() {
     eprintln!(
-        "Usage: shm2_relayd --shm-path <path> [--shm-size <bytes>] --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT] [--no-deep-copy] [--appsrc-max-buffers <n>] [--appsrc-max-bytes <n>] [--appsrc-max-time <ns>] [--appsrc-block|--appsrc-no-block] [--appsrc-leaky none|upstream|downstream]"
+        "Usage: shm2_relayd --shm-path <path> [--shm-size <bytes>] --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT] [--no-deep-copy]"
     );
 }
 
@@ -222,7 +158,6 @@ fn set_pipeline_time(pipeline: &gst::Pipeline, base_time: Option<gst::ClockTime>
 fn output_pipeline_create(
     shm_path: &str,
     shm_size: u64,
-    appsrc_cfg: AppSrcConfig,
 ) -> Result<(gst::Pipeline, gst_app::AppSrc), gst::glib::Error> {
     let pipeline_str = format!(
         "appsrc name=appsrc is-live=true format=time stream-type=stream ! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 leaky=downstream ! shm2sink shm-path={} shm-size={}",
@@ -243,22 +178,9 @@ fn output_pipeline_create(
     appsrc.set_property("is-live", true);
     appsrc.set_property("format", gst::Format::Time);
     appsrc.set_property("stream-type", gst_app::AppStreamType::Stream);
-    appsrc.set_property("block", appsrc_cfg.block);
-    appsrc.set_property("max-buffers", appsrc_cfg.max_buffers);
-    appsrc.set_property("max-bytes", appsrc_cfg.max_bytes);
-    appsrc.set_property(
-        "max-time",
-        gst::ClockTime::from_nseconds(appsrc_cfg.max_time_ns),
-    );
-    appsrc.set_property("leaky-type", appsrc_cfg.leaky);
+    appsrc.set_property("block", false);
 
     Ok((pipeline, appsrc))
-}
-
-#[derive(Clone)]
-struct UpstreamPipeline {
-    pipeline: gst::Pipeline,
-    caps_set: Arc<AtomicBool>,
 }
 
 fn backend_pipeline_create(
@@ -267,7 +189,7 @@ fn backend_pipeline_create(
     appsrc: &gst_app::AppSrc,
     base_time: Option<gst::ClockTime>,
     deep_copy: bool,
-) -> Result<UpstreamPipeline, gst::glib::Error> {
+) -> Result<gst::Pipeline, gst::glib::Error> {
     let element = gst::parse::launch(pipeline_str)?;
     let pipeline = match element.clone().downcast::<gst::Pipeline>() {
         Ok(p) => p,
@@ -333,15 +255,14 @@ fn backend_pipeline_create(
         gst::glib::Error::new(gst::CoreError::Failed, "failed to link appsink")
     })?;
 
-    Ok(UpstreamPipeline { pipeline, caps_set })
+    Ok(pipeline)
 }
 
 fn run_tcp_listener(
     spec: &ListenSpec,
     main_ctx: glib::MainContext,
-    appsrc: gst_app::AppSrc,
-    input_pipeline: Arc<UpstreamPipeline>,
-    splash_pipeline: Option<Arc<UpstreamPipeline>>,
+    input_pipeline: Arc<gst::Pipeline>,
+    splash_pipeline: Option<Arc<gst::Pipeline>>,
 ) -> io::Result<()> {
     let ListenSpec::Tcp { host, port } = spec else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not tcp"));
@@ -364,29 +285,16 @@ fn run_tcp_listener(
             .unwrap_or_else(|_| "<unknown>".to_string());
         println!("[shm2_relayd] client connected {peer}");
         let current = count.fetch_add(1, Ordering::SeqCst) + 1;
-        notify_client_count(
-            &main_ctx,
-            &appsrc,
-            &input_pipeline,
-            splash_pipeline.as_ref(),
-            current,
-        );
+        notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
 
         let main_ctx = main_ctx.clone();
         let input_pipeline = input_pipeline.clone();
         let splash_pipeline = splash_pipeline.clone();
-        let appsrc = appsrc.clone();
         let count_clone = count.clone();
         thread::spawn(move || {
             let _ = hold_connection(stream, &peer);
             let current = count_clone.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
-            notify_client_count(
-                &main_ctx,
-                &appsrc,
-                &input_pipeline,
-                splash_pipeline.as_ref(),
-                current,
-            );
+            notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
             println!("[shm2_relayd] client disconnected {peer}");
         });
     }
@@ -435,9 +343,8 @@ fn run_vsock_listener(
     cid: u32,
     port: u32,
     main_ctx: glib::MainContext,
-    appsrc: gst_app::AppSrc,
-    input_pipeline: Arc<UpstreamPipeline>,
-    splash_pipeline: Option<Arc<UpstreamPipeline>>,
+    input_pipeline: Arc<gst::Pipeline>,
+    splash_pipeline: Option<Arc<gst::Pipeline>>,
 ) -> io::Result<()> {
     use libc::{AF_VSOCK, SOCK_STREAM};
     use std::mem::size_of;
@@ -482,29 +389,16 @@ fn run_vsock_listener(
         }
         println!("[shm2_relayd] client connected vsock:{cid}:{port}");
         let current = count.fetch_add(1, Ordering::SeqCst) + 1;
-        notify_client_count(
-            &main_ctx,
-            &appsrc,
-            &input_pipeline,
-            splash_pipeline.as_ref(),
-            current,
-        );
+        notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
 
         let main_ctx = main_ctx.clone();
         let input_pipeline = input_pipeline.clone();
         let splash_pipeline = splash_pipeline.clone();
-        let appsrc = appsrc.clone();
         let count_clone = count.clone();
         thread::spawn(move || {
             let _ = hold_vsock_connection(conn, cid, port);
             let current = count_clone.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
-            notify_client_count(
-                &main_ctx,
-                &appsrc,
-                &input_pipeline,
-                splash_pipeline.as_ref(),
-                current,
-            );
+            notify_client_count(&main_ctx, &input_pipeline, splash_pipeline.as_ref(), current);
             println!("[shm2_relayd] client disconnected vsock:{cid}:{port}");
         });
     }
@@ -556,43 +450,25 @@ fn hold_vsock_connection(fd: RawFd, cid: u32, port: u32) -> io::Result<()> {
 
 fn notify_client_count(
     main_ctx: &glib::MainContext,
-    appsrc: &gst_app::AppSrc,
-    input_pipeline: &UpstreamPipeline,
-    splash_pipeline: Option<&Arc<UpstreamPipeline>>,
+    input_pipeline: &gst::Pipeline,
+    splash_pipeline: Option<&Arc<gst::Pipeline>>,
     count: usize,
 ) {
-    let appsrc = appsrc.clone();
     let input_pipeline = input_pipeline.clone();
     let splash_pipeline = splash_pipeline.cloned();
     main_ctx.invoke(move || {
         if count > 0 {
+            let _ = input_pipeline.set_state(gst::State::Playing);
             if let Some(splash) = &splash_pipeline {
-                let _ = splash.pipeline.set_state(gst::State::Null);
-                splash.caps_set.store(false, Ordering::Relaxed);
-            }
-            let _ = appsrc.set_caps(None);
-            flush_appsrc(&appsrc);
-            let _ = input_pipeline.pipeline.set_state(gst::State::Playing);
-            if let Some(splash) = &splash_pipeline {
-                let _ = splash.pipeline.set_state(gst::State::Null);
+                let _ = splash.set_state(gst::State::Null);
             }
         } else {
-            let _ = input_pipeline.pipeline.set_state(gst::State::Null);
-            input_pipeline.caps_set.store(false, Ordering::Relaxed);
-            let _ = appsrc.set_caps(None);
-            flush_appsrc(&appsrc);
+            let _ = input_pipeline.set_state(gst::State::Null);
             if let Some(splash) = &splash_pipeline {
-                let _ = splash.pipeline.set_state(gst::State::Playing);
+                let _ = splash.set_state(gst::State::Playing);
             }
         }
     });
-}
-
-fn flush_appsrc(appsrc: &gst_app::AppSrc) {
-    if let Some(src_pad) = appsrc.static_pad("src") {
-        let _ = src_pad.send_event(gst::event::FlushStart::new());
-        let _ = src_pad.send_event(gst::event::FlushStop::new(false));
-    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -600,7 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(Box::new(err));
     }
 
-    let (listen, shm_path, shm_size, input, splash, deep_copy, appsrc_cfg) = match parse_args() {
+    let (listen, shm_path, shm_size, input, splash, deep_copy) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             if e == "help" {
@@ -613,7 +489,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let (output_pipeline, appsrc) = output_pipeline_create(&shm_path, shm_size, appsrc_cfg)?;
+    let (output_pipeline, appsrc) = output_pipeline_create(&shm_path, shm_size)?;
     let base_time = output_pipeline.base_time();
 
     let input_pipeline =
@@ -653,7 +529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     output_pipeline.set_state(gst::State::Playing)?;
     if let Some(splash) = &splash_pipeline {
-        splash.pipeline.set_state(gst::State::Playing)?;
+        splash.set_state(gst::State::Playing)?;
     }
 
     let input_pipeline = Arc::new(input_pipeline);
@@ -665,20 +541,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let main_ctx = main_ctx.clone();
         let input_pipeline = input_pipeline.clone();
         let splash_pipeline = splash_pipeline.clone();
-        let appsrc = appsrc.clone();
         move || match listen {
             ListenSpec::Tcp { .. } => {
-                if let Err(err) =
-                    run_tcp_listener(&listen, main_ctx, appsrc, input_pipeline, splash_pipeline)
-                {
+                if let Err(err) = run_tcp_listener(&listen, main_ctx, input_pipeline, splash_pipeline) {
                     eprintln!("tcp listener error: {err}");
                 }
             }
             #[cfg(target_os = "linux")]
             ListenSpec::Vsock { cid, port } => {
-                if let Err(err) =
-                    run_vsock_listener(cid, port, main_ctx, appsrc, input_pipeline, splash_pipeline)
-                {
+                if let Err(err) = run_vsock_listener(cid, port, main_ctx, input_pipeline, splash_pipeline) {
                     eprintln!("vsock listener error: {err}");
                 }
             }
@@ -688,9 +559,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     main_loop.run();
 
     let _ = output_pipeline.set_state(gst::State::Null);
-    let _ = input_pipeline.pipeline.set_state(gst::State::Null);
+    let _ = input_pipeline.set_state(gst::State::Null);
     if let Some(splash) = &splash_pipeline {
-        let _ = splash.pipeline.set_state(gst::State::Null);
+        let _ = splash.set_state(gst::State::Null);
     }
 
     Ok(())
