@@ -83,13 +83,13 @@ fn normalize_caps_filters(input: &str) -> String {
     out.join(" ")
 }
 
-fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool), String> {
+fn parse_args() -> Result<(ListenSpec, String, String, Option<String>), String> {
     let mut listen = "tcp://0.0.0.0:5555".to_string();
     let mut shm_path: Option<String> = None;
-    let mut shm_size: u64 = 64 * 1024 * 1024;
+    let mut shm_size: Option<String> = None;
     let mut input: Option<String> = None;
     let mut splash: Option<String> = None;
-    let mut deep_copy = false;
+    let mut output: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -103,16 +103,16 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool
                 shm_path = Some(args.next().ok_or("--shm-path requires a value")?);
             }
             "--shm-size" => {
-                let value = args.next().ok_or("--shm-size requires a value")?;
-                shm_size = value
-                    .parse::<u64>()
-                    .map_err(|_| "--shm-size must be a u64")?;
+                shm_size = Some(args.next().ok_or("--shm-size requires a value")?);
             }
             "--input" => {
                 input = Some(args.next().ok_or("--input requires a pipeline string")?);
             }
             "--splash" => {
                 splash = Some(args.next().ok_or("--splash requires a pipeline string")?);
+            }
+            "--output" => {
+                output = Some(args.next().ok_or("--output requires a pipeline string")?);
             }
             "--help" | "-h" => {
                 return Err("help".to_string());
@@ -121,23 +121,25 @@ fn parse_args() -> Result<(ListenSpec, String, u64, String, Option<String>, bool
         }
     }
 
-    let shm_path = shm_path.ok_or("--shm-path is required")?;
+    if shm_path.is_some() || shm_size.is_some() {
+        return Err("--shm-path/--shm-size are deprecated; use --output".to_string());
+    }
+
     let input = input.ok_or("--input is required")?;
+    let output = output.ok_or("--output is required")?;
     let listen = parse_listen(&listen)?;
 
     Ok((
         listen,
-        shm_path,
-        shm_size,
         normalize_pipeline(&input),
+        normalize_pipeline(&output),
         splash.map(|p| normalize_pipeline(&p)),
-        deep_copy,
     ))
 }
 
 fn usage() {
     eprintln!(
-        "Usage: shm2_relayd --shm-path <path> [--shm-size <bytes>] --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT]"
+        "Usage: shm2_relayd --output <pipeline> --input <pipeline> [--splash <pipeline>] [--listen tcp://0.0.0.0:5555|vsock://CID:PORT]"
     );
 }
 
@@ -153,17 +155,19 @@ fn set_pipeline_time(pipeline: &gst::Pipeline, base_time: Option<gst::ClockTime>
 }
 
 fn output_pipeline_create(
-    shm_path: &str,
-    shm_size: u64,
+    pipeline_str: &str,
 ) -> Result<(gst::Pipeline, gst_app::AppSrc), gst::glib::Error> {
-    let pipeline_str = format!(
-        "appsrc name=appsrc is-live=true format=time stream-type=stream ! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 leaky=downstream ! shm2sink shm-path={} shm-size={}",
-        shm_path, shm_size
-    );
-    let element = gst::parse::launch(&pipeline_str)?;
-    let pipeline = element
-        .downcast::<gst::Pipeline>()
-        .map_err(|_| gst::glib::Error::new(gst::CoreError::Failed, "output pipeline must be a pipeline"))?;
+    let element = gst::parse::launch(pipeline_str)?;
+    let pipeline = match element.clone().downcast::<gst::Pipeline>() {
+        Ok(p) => p,
+        Err(element) => {
+            let pipeline = gst::Pipeline::with_name("output-pipeline");
+            pipeline
+                .add(&element)
+                .map_err(|err| gst::glib::Error::new(gst::CoreError::Failed, &err.to_string()))?;
+            pipeline
+        }
+    };
 
     set_pipeline_time(&pipeline, None);
 
@@ -473,7 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(Box::new(err));
     }
 
-    let (listen, shm_path, shm_size, input, splash, deep_copy) = match parse_args() {
+    let (listen, input, output, splash) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             if e == "help" {
@@ -486,9 +490,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let (output_pipeline, appsrc) = output_pipeline_create(&shm_path, shm_size)?;
+    let (output_pipeline, appsrc) = output_pipeline_create(&output)?;
     let base_time = output_pipeline.base_time();
 
+    let deep_copy = false;
     let input_pipeline =
         backend_pipeline_create("input-pipeline", &input, &appsrc, base_time, deep_copy)?;
     let splash_pipeline = if let Some(p) = splash.as_deref() {
@@ -562,4 +567,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_pipeline_requires_appsrc() {
+        gst::init().unwrap();
+        let res = output_pipeline_create("fakesrc ! fakesink");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn output_pipeline_accepts_appsrc() {
+        gst::init().unwrap();
+        let res = output_pipeline_create("appsrc name=appsrc ! fakesink");
+        assert!(res.is_ok());
+    }
 }

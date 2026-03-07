@@ -93,15 +93,14 @@ cargo run --bin shm2_producer -- winshm://Local/gst-shm2-demo 2000
 ## shm2_relayd (Socket-Driven Wrapper)
 
 `shm2_relayd` mirrors `v4l2-relayd` behavior using a TCP/vsock listener instead of V4L2 client usage events.
-The output pipeline is fixed (appsrc → shm2sink). When no clients are connected, the input pipeline is set to `NULL` for power efficiency.
+The output pipeline is explicit and must include `appsrc name=appsrc`. When no clients are connected, the input pipeline is set to `NULL` for power efficiency.
 
 Usage:
 
 ```bash
 cargo run --bin shm2_relayd -- \
   --listen tcp://0.0.0.0:5555 \
-  --shm-path shm:///dev/shm/gst-shm2-pipe \
-  --shm-size 67108864 \
+  --output "appsrc name=appsrc is-live=true format=time stream-type=stream ! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 leaky=downstream ! shm2sink shm-path=shm:///dev/shm/gst-shm2-pipe shm-size=67108864" \
   --input "videotestsrc is-live=true pattern=ball ! videoconvert"
 ```
 
@@ -110,17 +109,17 @@ Optional splash (runs only when no clients):
 ```bash
 cargo run --bin shm2_relayd -- \
   --listen tcp://0.0.0.0:5555 \
-  --shm-path shm:///dev/shm/gst-shm2-pipe \
-  --shm-size 67108864 \
+  --output "appsrc name=appsrc is-live=true format=time stream-type=stream ! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 leaky=downstream ! shm2sink shm-path=shm:///dev/shm/gst-shm2-pipe shm-size=67108864" \
   --input "v4l2src ! videoconvert" \
   --splash "videotestsrc is-live=true pattern=black ! videoconvert"
 ```
 
 Notes:
 - Output pipeline is always PLAYING; input pipeline toggles on client connect/disconnect.
-- `--shm-path` is the only output-side knob.
+- Output pipeline must include `appsrc name=appsrc` (similar to v4l2-relayd).
 - For Linux vsock: `--listen vsock://CID:PORT`.
 - Shallow buffer copy is the default (no payload duplication).
+- `--shm-path`/`--shm-size` are deprecated in favor of explicit `--output`.
 
 ## Plugin Discovery
 
